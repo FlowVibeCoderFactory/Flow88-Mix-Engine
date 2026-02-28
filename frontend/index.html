@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Flow88 Mix Engine</title>
+    <link rel="stylesheet" href="/frontend/styles.css">
+</head>
+<body>
+    <main class="app-shell">
+        <header class="topbar">
+            <div>
+                <p class="eyebrow">Flow88 Mix Engine</p>
+                <h1>Track Queue</h1>
+            </div>
+            <button id="refresh-button" class="refresh-button" type="button">Refresh</button>
+        </header>
+
+        <section class="action-row" aria-label="Action controls">
+            <div class="primary-actions">
+                <button id="render-button" class="render-button" type="button">Render Mix</button>
+                <button id="open-output-button" class="secondary-action-button" type="button">Open Output Folder</button>
+                <div class="sort-controls" role="group" aria-label="Sort controls">
+                    <button id="sort-bpm-button" class="sort-button" type="button">Sort BPM</button>
+                    <button id="sort-key-button" class="sort-button" type="button">Sort Key</button>
+                    <button id="sort-az-button" class="sort-button" type="button">Sort A-Z</button>
+                </div>
+            </div>
+            <p id="status" class="status">Loading tracks...</p>
+        </section>
+
+        <section class="table-shell" aria-label="Track list">
+            <table class="track-table" role="grid">
+                <tbody id="track-list-body" aria-live="polite"></tbody>
+            </table>
+        </section>
+    </main>
+
+    <script src="/frontend/app.js" defer></script>
+</body>
+</html>

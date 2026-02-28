@@ -1,0 +1,6 @@
+ffmpeg-python
+librosa
+mutagen
+fastapi
+uvicorn
+pywebview

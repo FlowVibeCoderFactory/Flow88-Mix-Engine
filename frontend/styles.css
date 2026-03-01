@@ -39,9 +39,9 @@ body {
     height: 34px;
     display: flex;
     align-items: center;
-    justify-content: space-between;
+    justify-content: flex-start;
     gap: 0.6rem;
-    margin-bottom: 0.32rem;
+    margin-bottom: 0.38rem;
 }
 
 .eyebrow {
@@ -75,6 +75,42 @@ h1 {
 
 .refresh-button:hover {
     background: #303033;
+}
+
+.tab-nav {
+    display: inline-flex;
+    gap: 0.34rem;
+    margin-bottom: 0.42rem;
+}
+
+.tab-button {
+    height: 30px;
+    border: 1px solid var(--line);
+    background: #2a2a2c;
+    color: var(--text);
+    border-radius: 999px;
+    padding: 0 0.8rem;
+    font-size: 0.74rem;
+    font-weight: 650;
+    cursor: pointer;
+}
+
+.tab-button:hover {
+    background: #303033;
+}
+
+.tab-button.active {
+    border-color: #2f6fc0;
+    background: #23446e;
+    color: #d7eaff;
+}
+
+.tab-panel {
+    display: none;
+}
+
+.tab-panel.active {
+    display: block;
 }
 
 .table-shell {
@@ -183,6 +219,11 @@ h1 {
     flex-wrap: wrap;
 }
 
+.status-wrap {
+    margin-left: auto;
+    min-width: min(420px, 100%);
+}
+
 .sort-controls {
     display: flex;
     align-items: center;
@@ -223,7 +264,7 @@ h1 {
 
 .status {
     margin: 0;
-    min-width: min(360px, 100%);
+    min-width: 100%;
     color: var(--muted);
     font-size: 0.77rem;
     line-height: 1.5;
@@ -259,6 +300,75 @@ h1 {
     cursor: progress;
 }
 
+.render-progress {
+    margin-top: 0.2rem;
+    margin-left: auto;
+    width: min(320px, 100%);
+    height: 4px;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    overflow: hidden;
+    background: #242427;
+}
+
+.render-progress.hidden {
+    display: none;
+}
+
+.render-progress-bar {
+    display: block;
+    width: 36%;
+    height: 100%;
+    border-radius: inherit;
+    background: linear-gradient(90deg, #1f7de5 0%, #43a2ff 100%);
+    animation: render-progress-slide 1.12s linear infinite;
+}
+
+@keyframes render-progress-slide {
+    0% {
+        transform: translateX(-140%);
+    }
+    100% {
+        transform: translateX(340%);
+    }
+}
+
+.col-video-preview {
+    width: 102px;
+    padding-right: 0;
+}
+
+.video-thumb {
+    display: block;
+    width: 88px;
+    height: 50px;
+    object-fit: cover;
+    background: #111;
+    border: 1px solid #3d3d40;
+    border-radius: 6px;
+}
+
+.video-meta-stack {
+    display: inline-flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 0.28rem;
+}
+
+.col-video-title {
+    width: 52%;
+    color: var(--text);
+    font-size: 0.8rem;
+    font-weight: 620;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.col-video-details {
+    width: 34%;
+    text-align: right;
+}
+
 @media (max-width: 760px) {
     .app-shell {
         width: calc(100% - 0.5rem);
@@ -274,9 +384,16 @@ h1 {
         justify-content: flex-start;
     }
 
-    .status {
+    .status-wrap {
         min-width: 100%;
+    }
+
+    .status {
         text-align: left;
+    }
+
+    .render-progress {
+        margin-left: 0;
     }
 
     .col-artist {
@@ -290,5 +407,14 @@ h1 {
     .col-key,
     .col-bpm {
         width: 62px;
+    }
+
+    .col-video-details {
+        width: auto;
+    }
+
+    .video-meta-stack {
+        justify-content: flex-start;
+        flex-wrap: wrap;
     }
 }

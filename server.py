@@ -18,8 +18,9 @@ from main import (
     ensure_runtime_directories,
 )
 from mixer import DEFAULT_CROSSFADE_SECONDS, build_timeline, render_mix
-from models import TrackAnalysis
+from models import TrackAnalysis, VideoAnalysis
 from tracklist import write_tracklist
+from video_processor import analyze_video_directory, render_final_video
 
 
 class TrackDTO(BaseModel):
@@ -38,6 +39,18 @@ class TrackListResponse(BaseModel):
     tracks: list[TrackDTO]
 
 
+class VideoDTO(BaseModel):
+    file_name: str
+    duration_seconds: float
+    width: int | None
+    height: int | None
+    frame_rate: float | None
+
+
+class VideoListResponse(BaseModel):
+    videos: list[VideoDTO]
+
+
 class MixRequest(BaseModel):
     tracks: list[str] = Field(..., min_length=1)
 
@@ -48,9 +61,23 @@ class MixResponse(BaseModel):
     tracks_rendered: int
 
 
+class GenerateVideoRequest(BaseModel):
+    videos: list[str] = Field(..., min_length=1)
+
+
+class GenerateVideoResponse(BaseModel):
+    video_output_path: str
+    audio_input_path: str
+    clips_requested: int
+    encoder: str
+
+
 app = FastAPI(title="Flow88 Mix Engine API", version="0.1.0")
 PROJECT_ROOT = Path(__file__).resolve().parent
 FRONTEND_DIR = PROJECT_ROOT / "frontend"
+VIDEO_INPUT_DIR = INPUT_DIR / "videos"
+FINAL_VIDEO_AUDIO_FILENAME = "final_mix.wav"
+FINAL_VIDEO_OUTPUT_FILENAME = "flow88_final_video.mov"
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -60,6 +87,7 @@ app.add_middleware(
 )
 if FRONTEND_DIR.exists():
     app.mount("/frontend", StaticFiles(directory=str(FRONTEND_DIR)), name="frontend")
+app.mount("/input/videos", StaticFiles(directory=str(VIDEO_INPUT_DIR), check_dir=False), name="input-videos")
 
 
 def _track_to_dto(track: TrackAnalysis) -> TrackDTO:
@@ -76,12 +104,31 @@ def _track_to_dto(track: TrackAnalysis) -> TrackDTO:
     )
 
 
+def _video_to_dto(video: VideoAnalysis) -> VideoDTO:
+    return VideoDTO(
+        file_name=video.file_path.name,
+        duration_seconds=video.duration_seconds,
+        width=video.width,
+        height=video.height,
+        frame_rate=video.frame_rate,
+    )
+
+
 def _load_tracks() -> list[TrackAnalysis]:
     ensure_runtime_directories()
     tracks = analyze_directory(INPUT_DIR)
     if not tracks:
         raise HTTPException(status_code=404, detail=f"No supported audio files found in: {INPUT_DIR.resolve()}")
     return tracks
+
+
+def _load_videos() -> list[VideoAnalysis]:
+    ensure_runtime_directories()
+    VIDEO_INPUT_DIR.mkdir(parents=True, exist_ok=True)
+    videos = analyze_video_directory(VIDEO_INPUT_DIR)
+    if not videos:
+        raise HTTPException(status_code=404, detail=f"No supported video files found in: {VIDEO_INPUT_DIR.resolve()}")
+    return videos
 
 
 def _resolve_ordered_tracks(all_tracks: list[TrackAnalysis], ordered_file_names: list[str]) -> list[TrackAnalysis]:
@@ -102,6 +149,24 @@ def _resolve_ordered_tracks(all_tracks: list[TrackAnalysis], ordered_file_names:
     return ordered_tracks
 
 
+def _resolve_ordered_videos(all_videos: list[VideoAnalysis], ordered_file_names: list[str]) -> list[VideoAnalysis]:
+    video_by_file_name = {video.file_path.name: video for video in all_videos}
+    ordered_videos: list[VideoAnalysis] = []
+    seen: set[str] = set()
+
+    for file_name in ordered_file_names:
+        if file_name in seen:
+            raise HTTPException(status_code=400, detail=f"Duplicate video name in request: {file_name}")
+        seen.add(file_name)
+
+        video = video_by_file_name.get(file_name)
+        if video is None:
+            raise HTTPException(status_code=400, detail=f"Unknown video name: {file_name}")
+        ordered_videos.append(video)
+
+    return ordered_videos
+
+
 @app.get("/", include_in_schema=False)
 def get_index() -> FileResponse:
     index_path = FRONTEND_DIR / "index.html"
@@ -114,6 +179,12 @@ def get_index() -> FileResponse:
 def get_tracks() -> TrackListResponse:
     tracks = _load_tracks()
     return TrackListResponse(tracks=[_track_to_dto(track) for track in tracks])
+
+
+@app.get("/videos", response_model=VideoListResponse)
+def get_videos() -> VideoListResponse:
+    videos = _load_videos()
+    return VideoListResponse(videos=[_video_to_dto(video) for video in videos])
 
 
 @app.post("/mix", response_model=MixResponse)
@@ -139,6 +210,41 @@ def post_mix(request: MixRequest) -> MixResponse:
         mix_output_path=str(Path(rendered_mix_path).resolve()),
         tracklist_output_path=str(Path(rendered_tracklist_path).resolve()),
         tracks_rendered=len(ordered_tracks),
+    )
+
+
+@app.post("/generate-video", response_model=GenerateVideoResponse)
+def post_generate_video(request: GenerateVideoRequest) -> GenerateVideoResponse:
+    all_videos = _load_videos()
+    ordered_videos = _resolve_ordered_videos(all_videos, request.videos)
+
+    audio_input_path = OUTPUT_DIR / FINAL_VIDEO_AUDIO_FILENAME
+    if not audio_input_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Audio source not found: {audio_input_path.resolve()}",
+        )
+
+    output_video_path = OUTPUT_DIR / FINAL_VIDEO_OUTPUT_FILENAME
+
+    try:
+        rendered_output_path, encoder = render_final_video(
+            audio_mix_path=audio_input_path,
+            ordered_video_paths=[video.file_path for video in ordered_videos],
+            output_path=output_video_path,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return GenerateVideoResponse(
+        video_output_path=str(Path(rendered_output_path).resolve()),
+        audio_input_path=str(audio_input_path.resolve()),
+        clips_requested=len(ordered_videos),
+        encoder=encoder,
     )
 
 

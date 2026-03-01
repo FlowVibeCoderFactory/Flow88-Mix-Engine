@@ -25,3 +25,16 @@ class TrackAnalysis:
 class TimelineEntry:
     absolute_start_seconds: float
     track: TrackAnalysis
+
+
+@dataclass(slots=True)
+class VideoAnalysis:
+    file_path: Path
+    duration_seconds: float
+    width: int | None
+    height: int | None
+    frame_rate: float | None
+
+    @property
+    def playable_duration_seconds(self) -> float:
+        return max(0.0, self.duration_seconds)

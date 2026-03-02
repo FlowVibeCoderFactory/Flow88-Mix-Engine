@@ -24,6 +24,8 @@ CHUNK_SIZE = 6
 CHUNK_CONCAT_FILENAME = "chunks.txt"
 LOOP_FILTER_SCRIPT_FILENAME = "loop_filter.txt"
 FINAL_FILTER_SCRIPT_FILENAME = "final_filter.txt"
+COMPOSITE_FILTER_SCRIPT_FILENAME = "composite_filter.txt"
+RENDER_MODE = "gpu_composite"  # options: "gpu_composite", "legacy"
 
 
 @dataclass(slots=True)
@@ -235,6 +237,14 @@ def detect_h264_encoder() -> str:
     return DEFAULT_VIDEO_CODEC
 
 
+def detect_gpu_pipeline() -> bool:
+    try:
+        output = _run_command(["ffmpeg", "-hide_banner", "-hwaccels"], "Failed to query hwaccels")
+        return "cuda" in output.lower()
+    except Exception:
+        return False
+
+
 def make_seamless_loop_clip(
     input_clip_path: Path,
     output_clip_path: Path,
@@ -371,6 +381,86 @@ def _build_scene_filtergraph(
     return ";".join(filter_parts)
 
 
+def _build_composite_filtergraph(
+    scenes: list[SceneSegment],
+    crossfade_seconds: float,
+    target_duration_seconds: float,
+    use_cuda: bool = True,
+) -> str:
+    if not scenes:
+        raise ValueError("Cannot build a composite filtergraph without scenes.")
+
+    filter_parts: list[str] = []
+    start_offsets: list[float] = []
+    running_offset = 0.0
+
+    for index, scene in enumerate(scenes):
+        start_offsets.append(max(0.0, running_offset))
+        if index < len(scenes) - 1:
+            running_offset += max(0.001, scene.duration_seconds - crossfade_seconds)
+
+    if use_cuda:
+        filter_parts.append(
+            f"color=c=black:s={TARGET_RENDER_WIDTH}x{TARGET_RENDER_HEIGHT}:r={TARGET_RENDER_FPS}:d={target_duration_seconds:.6f},"
+            "format=rgba,hwupload_cuda[base]"
+        )
+    else:
+        filter_parts.append(
+            f"color=c=black:s={TARGET_RENDER_WIDTH}x{TARGET_RENDER_HEIGHT}:r={TARGET_RENDER_FPS}:d={target_duration_seconds:.6f},"
+            "format=rgba[base]"
+        )
+
+    for index, scene in enumerate(scenes):
+        scene_duration = max(0.001, scene.duration_seconds)
+        scene_chain = f"[{index}:v]fps={TARGET_RENDER_FPS},"
+
+        if use_cuda:
+            scene_chain += (
+                f"scale_cuda={TARGET_RENDER_WIDTH}:{TARGET_RENDER_HEIGHT}:force_original_aspect_ratio=decrease,"
+                "hwdownload,format=rgba,"
+            )
+        else:
+            scene_chain += (
+                f"scale={TARGET_RENDER_WIDTH}:{TARGET_RENDER_HEIGHT}:force_original_aspect_ratio=decrease,"
+                "format=rgba,"
+            )
+
+        scene_chain += f"pad={TARGET_RENDER_WIDTH}:{TARGET_RENDER_HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black,"
+
+        if index > 0:
+            scene_chain += f"fade=t=in:st=0:d={crossfade_seconds:.6f}:alpha=1,"
+        if index < len(scenes) - 1:
+            fade_out_start = max(0.0, scene_duration - crossfade_seconds)
+            scene_chain += f"fade=t=out:st={fade_out_start:.6f}:d={crossfade_seconds:.6f}:alpha=1,"
+
+        scene_chain += f"setpts=PTS-STARTPTS+{start_offsets[index]:.6f}/TB"
+        if use_cuda:
+            scene_chain += ",hwupload_cuda"
+
+        scene_chain += f"[v{index}]"
+        filter_parts.append(scene_chain)
+
+    current_label = "base"
+    for index in range(len(scenes)):
+        output_label = f"cmp{index}"
+        if use_cuda:
+            filter_parts.append(f"[{current_label}][v{index}]overlay_cuda=x=0:y=0[{output_label}]")
+        else:
+            filter_parts.append(f"[{current_label}][v{index}]overlay=x=0:y=0:format=auto[{output_label}]")
+        current_label = output_label
+
+    if use_cuda:
+        filter_parts.append(
+            f"[{current_label}]hwdownload,format=yuv420p,trim=duration={target_duration_seconds:.6f},setpts=PTS-STARTPTS[vout]"
+        )
+    else:
+        filter_parts.append(
+            f"[{current_label}]format=yuv420p,trim=duration={target_duration_seconds:.6f},setpts=PTS-STARTPTS[vout]"
+        )
+
+    return ";".join(filter_parts)
+
+
 def _render_scene_chunk(
     chunk_scenes: list[SceneSegment],
     chunk_index: int,
@@ -430,6 +520,69 @@ def _render_scene_chunk(
             filter_script_path.unlink(missing_ok=True)
 
     return output_chunk_path
+
+
+def _render_gpu_composite(
+    scenes: list[SceneSegment],
+    audio_mix_path: Path,
+    output_path: Path,
+    temporary_dir: Path,
+    target_duration_seconds: float,
+    scene_crossfade_seconds: float,
+) -> None:
+    if not scenes:
+        raise ValueError("Cannot render GPU composite output without scenes.")
+
+    filter_script_path = (temporary_dir / COMPOSITE_FILTER_SCRIPT_FILENAME).resolve()
+    filter_complex = _build_composite_filtergraph(
+        scenes=scenes,
+        crossfade_seconds=scene_crossfade_seconds,
+        target_duration_seconds=target_duration_seconds,
+        use_cuda=True,
+    )
+    _write_filter_script(filter_complex, filter_script_path)
+
+    command: list[str] = ["ffmpeg", "-y"]
+    for scene in scenes:
+        command.extend(["-hwaccel", "cuda", "-hwaccel_output_format", "cuda", "-i", str(scene.file_path)])
+
+    audio_index = len(scenes)
+    command.extend(
+        [
+            "-i",
+            str(audio_mix_path),
+            "-filter_complex_script",
+            str(filter_script_path),
+            "-map",
+            "[vout]",
+            "-map",
+            f"{audio_index}:a:0",
+            "-r",
+            str(TARGET_RENDER_FPS),
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "h264_nvenc",
+            "-preset",
+            "p5",
+            "-rc",
+            "vbr",
+            "-cq",
+            "19",
+            "-b:v",
+            "0",
+            "-c:a",
+            DEFAULT_AUDIO_CODEC,
+            "-shortest",
+            str(output_path),
+        ]
+    )
+
+    try:
+        _run_command(command, error_prefix="GPU composite render failed")
+    finally:
+        if filter_script_path.exists():
+            filter_script_path.unlink(missing_ok=True)
 
 
 def _stitch_chunks(
@@ -556,6 +709,29 @@ def render_final_video(
         raise RuntimeError("Scene expansion did not produce any renderable scenes.")
 
     encoder = detect_h264_encoder()
+
+    mode = RENDER_MODE.lower().strip()
+    if mode not in {"gpu_composite", "legacy"}:
+        print(f"Unknown render mode '{RENDER_MODE}'. Falling back to legacy mode.", file=sys.stderr)
+        mode = "legacy"
+
+    if mode == "gpu_composite":
+        gpu_ready = detect_gpu_pipeline() and encoder == "h264_nvenc"
+        if gpu_ready:
+            try:
+                _render_gpu_composite(
+                    scenes=scenes,
+                    audio_mix_path=audio_mix_path,
+                    output_path=output_path,
+                    temporary_dir=temporary_dir,
+                    target_duration_seconds=target_duration_seconds,
+                    scene_crossfade_seconds=scene_crossfade_seconds,
+                )
+                return output_path, encoder
+            except RuntimeError as exc:
+                print(f"GPU composite mode failed. Falling back to legacy mode: {exc}", file=sys.stderr)
+        else:
+            print("GPU composite mode unavailable. Falling back to legacy mode.", file=sys.stderr)
 
     chunked_scenes = _chunk_list(scenes, CHUNK_SIZE)
     chunk_paths: list[Path] = []

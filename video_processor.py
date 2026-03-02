@@ -19,6 +19,11 @@ TARGET_RENDER_FPS = 30
 DEFAULT_AUDIO_CODEC = "pcm_s24le"
 DEFAULT_VIDEO_CODEC = "libx264"
 MAX_SCENE_SEGMENTS = 600
+PREVIEW_LOOP_FILENAME = "loop_preview.mp4"
+CHUNK_SIZE = 6
+CHUNK_CONCAT_FILENAME = "chunks.txt"
+LOOP_FILTER_SCRIPT_FILENAME = "loop_filter.txt"
+FINAL_FILTER_SCRIPT_FILENAME = "final_filter.txt"
 
 
 @dataclass(slots=True)
@@ -100,6 +105,40 @@ def _run_command(command: list[str], error_prefix: str) -> str:
         raise RuntimeError(f"{error_prefix}: {stderr}") from exc
 
     return (result.stdout or "") + (result.stderr or "")
+
+
+def _write_filter_script(filter_complex: str, script_path: Path) -> None:
+    script_path.write_text(filter_complex, encoding="utf-8")
+
+
+def _loop_cache_path(input_path: Path, cache_dir: Path) -> Path:
+    return cache_dir / f"{input_path.stem}_loop.mp4"
+
+
+def _escape_concat_path(file_path: Path) -> str:
+    absolute_posix = str(file_path.resolve()).replace("\\", "/")
+    return absolute_posix.replace("'", "\\'")
+
+
+def _write_concat_inputs_file(input_paths: list[Path], concat_file_path: Path) -> None:
+    concat_lines = [f"file '{_escape_concat_path(path)}'" for path in input_paths]
+    concat_file_path.write_text("\n".join(concat_lines) + "\n", encoding="utf-8")
+
+
+def _chunk_list(items: list, size: int) -> list[list]:
+    if size <= 0:
+        raise ValueError("Chunk size must be greater than zero.")
+    return [items[index : index + size] for index in range(0, len(items), size)]
+
+
+def _assembled_duration_seconds(scenes: list[SceneSegment], crossfade_seconds: float) -> float:
+    if not scenes:
+        return 0.0
+
+    total_duration = scenes[0].duration_seconds
+    for scene in scenes[1:]:
+        total_duration += max(0.001, scene.duration_seconds - crossfade_seconds)
+    return max(0.0, total_duration)
 
 
 def _require_ffmpeg_tools() -> None:
@@ -201,6 +240,15 @@ def make_seamless_loop_clip(
     output_clip_path: Path,
     crossfade_seconds: float = SEAMLESS_LOOP_CROSSFADE_SECONDS,
 ) -> VideoAnalysis:
+    cache_dir = output_clip_path.parent
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    looped_path = _loop_cache_path(input_clip_path, cache_dir)
+    preview_path = cache_dir / PREVIEW_LOOP_FILENAME
+
+    if looped_path.exists():
+        shutil.copy2(looped_path, preview_path)
+        return analyze_video(looped_path)
+
     clip_analysis = analyze_video(input_clip_path)
     clip_duration = clip_analysis.playable_duration_seconds
 
@@ -216,22 +264,22 @@ def make_seamless_loop_clip(
     output_clip_path.parent.mkdir(parents=True, exist_ok=True)
 
     filter_complex = (
-        f"[0:v]split=2[first_raw][second_raw];"
+        "split=2[first_raw][second_raw];"
         f"[first_raw]trim=start=0:end={midpoint_seconds:.6f},setpts=PTS-STARTPTS[first_half];"
         f"[second_raw]trim=start={midpoint_seconds:.6f}:end={clip_duration:.6f},setpts=PTS-STARTPTS[second_half];"
         f"[second_half][first_half]xfade=transition=fade:duration={crossfade_seconds:.6f}:offset={xfade_offset:.6f},"
-        f"format=yuv420p,setsar=1[looped]"
+        "format=yuv420p,setsar=1"
     )
+    filter_script_path = (output_clip_path.parent / LOOP_FILTER_SCRIPT_FILENAME).resolve()
+    _write_filter_script(filter_complex, filter_script_path)
 
     command = [
         "ffmpeg",
         "-y",
         "-i",
         str(input_clip_path),
-        "-filter_complex",
-        filter_complex,
-        "-map",
-        "[looped]",
+        "-filter_script:v",
+        str(filter_script_path),
         "-an",
         "-c:v",
         DEFAULT_VIDEO_CODEC,
@@ -239,11 +287,17 @@ def make_seamless_loop_clip(
         "medium",
         "-crf",
         "18",
-        str(output_clip_path),
+        str(looped_path),
     ]
 
-    _run_command(command, error_prefix=f"Failed to build seamless loop for '{input_clip_path.name}'")
-    return analyze_video(output_clip_path)
+    try:
+        _run_command(command, error_prefix=f"Failed to build seamless loop for '{input_clip_path.name}'")
+    finally:
+        if filter_script_path.exists():
+            filter_script_path.unlink(missing_ok=True)
+
+    shutil.copy2(looped_path, preview_path)
+    return analyze_video(looped_path)
 
 
 def _build_scene_sequence(
@@ -286,10 +340,9 @@ def _build_scene_filtergraph(
     crossfade_seconds: float,
 ) -> str:
     filter_parts: list[str] = []
-
     for index, scene in enumerate(scenes):
         filter_parts.append(
-            f"[{index}:v]settb=AVTB,setpts=PTS-STARTPTS,trim=duration={scene.duration_seconds:.6f},"
+            f"[{index}:v]setpts=PTS-STARTPTS,trim=duration={scene.duration_seconds:.6f},"
             f"fps={TARGET_RENDER_FPS},"
             f"scale={TARGET_RENDER_WIDTH}:{TARGET_RENDER_HEIGHT}:force_original_aspect_ratio=decrease,"
             f"pad={TARGET_RENDER_WIDTH}:{TARGET_RENDER_HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black,"
@@ -297,9 +350,7 @@ def _build_scene_filtergraph(
         )
 
     if len(scenes) == 1:
-        filter_parts.append(
-            f"[v0]trim=duration={target_duration_seconds:.6f},setpts=PTS-STARTPTS[vout]"
-        )
+        filter_parts.append(f"[v0]trim=duration={target_duration_seconds:.6f},setpts=PTS-STARTPTS[vout]")
         return ";".join(filter_parts)
 
     running_duration = scenes[0].duration_seconds
@@ -320,6 +371,143 @@ def _build_scene_filtergraph(
     return ";".join(filter_parts)
 
 
+def _render_scene_chunk(
+    chunk_scenes: list[SceneSegment],
+    chunk_index: int,
+    temporary_dir: Path,
+    encoder: str,
+    chunk_target_duration: float,
+    scene_crossfade_seconds: float,
+    final_filter_filename: str = FINAL_FILTER_SCRIPT_FILENAME,
+) -> Path:
+    if not chunk_scenes:
+        raise ValueError("Cannot render an empty scene chunk.")
+    if chunk_target_duration <= 0:
+        raise ValueError("Chunk target duration must be positive.")
+
+    output_chunk_path = temporary_dir / f"chunk_{chunk_index:04d}.mp4"
+    filter_script_path = (temporary_dir / f"chunk_{chunk_index:04d}_{final_filter_filename}").resolve()
+    filter_complex = _build_scene_filtergraph(
+        scenes=chunk_scenes,
+        target_duration_seconds=chunk_target_duration,
+        crossfade_seconds=scene_crossfade_seconds,
+    )
+    _write_filter_script(filter_complex, filter_script_path)
+
+    command: list[str] = ["ffmpeg", "-y"]
+    for scene in chunk_scenes:
+        command.extend(["-i", str(scene.file_path)])
+
+    command.extend(
+        [
+            "-filter_complex_script",
+            str(filter_script_path),
+            "-map",
+            "[vout]",
+            "-an",
+            "-r",
+            str(TARGET_RENDER_FPS),
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            encoder,
+        ]
+    )
+
+    if encoder == "h264_nvenc":
+        command.extend(["-preset", "p5", "-rc", "vbr", "-cq", "19", "-b:v", "0"])
+    elif encoder == "h264_videotoolbox":
+        command.extend(["-b:v", "25M", "-allow_sw", "1"])
+    else:
+        command.extend(["-preset", "medium", "-crf", "18"])
+
+    command.append(str(output_chunk_path))
+
+    try:
+        _run_command(command, error_prefix=f"Failed to render scene chunk {chunk_index}")
+    finally:
+        if filter_script_path.exists():
+            filter_script_path.unlink(missing_ok=True)
+
+    return output_chunk_path
+
+
+def _stitch_chunks(
+    chunk_paths: list[Path],
+    chunk_concat_path: Path,
+    stitched_video_path: Path,
+) -> Path:
+    if not chunk_paths:
+        raise ValueError("No chunks available to stitch.")
+
+    if len(chunk_paths) == 1:
+        return chunk_paths[0]
+
+    _write_concat_inputs_file(chunk_paths, chunk_concat_path)
+
+    command = [
+        "ffmpeg",
+        "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        str(chunk_concat_path),
+        "-c",
+        "copy",
+        str(stitched_video_path),
+    ]
+    _run_command(command, error_prefix="Failed to stitch rendered chunks")
+    return stitched_video_path
+
+
+def _mux_audio_once(
+    stitched_video_path: Path,
+    audio_mix_path: Path,
+    output_path: Path,
+) -> None:
+    pcm_command = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(stitched_video_path),
+        "-i",
+        str(audio_mix_path),
+        "-c:v",
+        "copy",
+        "-c:a",
+        DEFAULT_AUDIO_CODEC,
+        "-shortest",
+        str(output_path),
+    ]
+
+    try:
+        _run_command(pcm_command, error_prefix="Failed to mux final audio/video output")
+        return
+    except RuntimeError as pcm_error:
+        aac_command = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(stitched_video_path),
+            "-i",
+            str(audio_mix_path),
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "320k",
+            "-shortest",
+            str(output_path),
+        ]
+        try:
+            _run_command(aac_command, error_prefix="Failed to mux final output (AAC fallback)")
+        except RuntimeError as fallback_error:
+            raise RuntimeError(f"{pcm_error} | Fallback failed: {fallback_error}") from fallback_error
+
+
 def render_final_video(
     audio_mix_path: Path,
     ordered_video_paths: list[Path],
@@ -327,6 +515,7 @@ def render_final_video(
     work_dir: Path | None = None,
     seamless_crossfade_seconds: float = SEAMLESS_LOOP_CROSSFADE_SECONDS,
     scene_crossfade_seconds: float = SCENE_CROSSFADE_SECONDS,
+    keep_intermediate_files: bool = False,
 ) -> tuple[Path, str]:
     if not ordered_video_paths:
         raise ValueError("No video clips provided.")
@@ -363,53 +552,61 @@ def render_final_video(
         target_duration_seconds=target_duration_seconds,
         crossfade_seconds=scene_crossfade_seconds,
     )
+    if not scenes:
+        raise RuntimeError("Scene expansion did not produce any renderable scenes.")
 
     encoder = detect_h264_encoder()
-    filter_complex = _build_scene_filtergraph(
-        scenes=scenes,
-        target_duration_seconds=target_duration_seconds,
-        crossfade_seconds=scene_crossfade_seconds,
-    )
 
-    command: list[str] = ["ffmpeg", "-y"]
+    chunked_scenes = _chunk_list(scenes, CHUNK_SIZE)
+    chunk_paths: list[Path] = []
+    stitched_video_path: Path | None = None
+    chunk_concat_path = temporary_dir / CHUNK_CONCAT_FILENAME
+    stitched_intermediate_path = temporary_dir / "stitched_video.mp4"
+    remaining_duration_seconds = target_duration_seconds
 
-    for scene in scenes:
-        command.extend(["-i", str(scene.file_path)])
+    try:
+        for chunk_index, chunk_scenes in enumerate(chunked_scenes):
+            if remaining_duration_seconds <= 0:
+                break
 
-    audio_index = len(scenes)
-    command.extend(["-i", str(audio_mix_path)])
-    command.extend(
-        [
-            "-filter_complex",
-            filter_complex,
-            "-map",
-            "[vout]",
-            "-map",
-            f"{audio_index}:a:0",
-            "-r",
-            str(TARGET_RENDER_FPS),
-            "-pix_fmt",
-            "yuv420p",
-            "-c:v",
-            encoder,
-        ]
-    )
+            full_chunk_duration = _assembled_duration_seconds(chunk_scenes, scene_crossfade_seconds)
+            chunk_target_duration = min(full_chunk_duration, remaining_duration_seconds)
+            if chunk_target_duration <= 0:
+                continue
 
-    if encoder == "h264_nvenc":
-        command.extend(["-preset", "p5", "-rc", "vbr", "-cq", "19", "-b:v", "0"])
-    elif encoder == "h264_videotoolbox":
-        command.extend(["-b:v", "25M", "-allow_sw", "1"])
-    else:
-        command.extend(["-preset", "medium", "-crf", "18"])
+            chunk_path = _render_scene_chunk(
+                chunk_scenes=chunk_scenes,
+                chunk_index=chunk_index,
+                temporary_dir=temporary_dir,
+                encoder=encoder,
+                chunk_target_duration=chunk_target_duration,
+                scene_crossfade_seconds=scene_crossfade_seconds,
+                final_filter_filename=FINAL_FILTER_SCRIPT_FILENAME,
+            )
+            chunk_paths.append(chunk_path)
+            remaining_duration_seconds -= chunk_target_duration
 
-    command.extend(
-        [
-            "-c:a",
-            DEFAULT_AUDIO_CODEC,
-            "-shortest",
-            str(output_path),
-        ]
-    )
+        if not chunk_paths:
+            raise RuntimeError("No video chunks were rendered for final assembly.")
 
-    _run_command(command, error_prefix="Failed to render final video")
+        stitched_video_path = _stitch_chunks(
+            chunk_paths=chunk_paths,
+            chunk_concat_path=chunk_concat_path,
+            stitched_video_path=stitched_intermediate_path,
+        )
+        _mux_audio_once(stitched_video_path=stitched_video_path, audio_mix_path=audio_mix_path, output_path=output_path)
+    finally:
+        if chunk_concat_path.exists():
+            chunk_concat_path.unlink(missing_ok=True)
+
+        if not keep_intermediate_files:
+            for chunk_path in chunk_paths:
+                if chunk_path.exists():
+                    chunk_path.unlink(missing_ok=True)
+
+            if stitched_video_path is not None and stitched_video_path.exists() and stitched_video_path not in chunk_paths:
+                stitched_video_path.unlink(missing_ok=True)
+            elif stitched_video_path is None and stitched_intermediate_path.exists():
+                stitched_intermediate_path.unlink(missing_ok=True)
+
     return output_path, encoder

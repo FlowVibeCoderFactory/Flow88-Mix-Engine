@@ -14,6 +14,8 @@ const refreshAudioButton = document.getElementById("refresh-audio-button");
 const refreshVideoButton = document.getElementById("refresh-video-button");
 const renderButton = document.getElementById("render-button");
 const masterVideoButton = document.getElementById("master-video-button");
+const openSourceAudioButton = document.getElementById("open-source-audio-button");
+const openSourceVideoButton = document.getElementById("open-source-video-button");
 const openOutputAudioButton = document.getElementById("open-output-audio-button");
 const openOutputVideoButton = document.getElementById("open-output-video-button");
 
@@ -278,7 +280,7 @@ async function renderMix() {
     }
 }
 
-async function generateVideoMaster() {
+async function generateVideo() {
     if (state.videos.length === 0) {
         setStatus("video", "Video queue is empty.", "error");
         return;
@@ -289,21 +291,38 @@ async function generateVideoMaster() {
     setStatus("video", "Mastering video...");
 
     try {
-        const response = await fetch(`${apiBase}/generate-video`, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json"
-            },
-            body: JSON.stringify({
-                videos: state.videos.map((video) => video.file_name)
-            })
+        const response = await fetch('/generate-video', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ videos: state.videos.map(v => v.file_name) }) // Match the "videos" key
         });
 
-        const payload = await response.json();
         if (!response.ok) {
-            throw new Error(payload.detail || "Video mastering failed.");
+            const contentType = response.headers.get("content-type") || "";
+            let message = `Video mastering failed (HTTP ${response.status}).`;
+
+            if (contentType.includes("application/json")) {
+                const errorPayload = await response.json();
+                if (typeof errorPayload?.detail === "string" && errorPayload.detail.trim()) {
+                    message = errorPayload.detail.trim();
+                }
+            } else {
+                const errorText = (await response.text()).trim();
+                if (errorText) {
+                    message = errorText;
+                }
+            }
+
+            throw new Error(message);
         }
 
+        const contentType = response.headers.get("content-type") || "";
+        if (!contentType.includes("application/json")) {
+            const responseText = (await response.text()).trim();
+            throw new Error(responseText || "Video mastering succeeded with an unexpected response format.");
+        }
+
+        const payload = await response.json();
         setStatus("video", `Master video complete: ${payload.video_output_path}`, "success");
     } catch (error) {
         setStatus("video", error.message, "error");
@@ -324,6 +343,24 @@ async function openOutputFolder(tab) {
         }
 
         setStatus(tab, `Opened output folder: ${payload.output_dir}`, "success");
+    } catch (error) {
+        setStatus(tab, error.message, "error");
+    }
+}
+
+async function openSourceFolder(tab) {
+    setStatus(tab, "Opening source folder...");
+    const endpoint = tab === "video" ? "/open-video-source" : "/open-audio-source";
+
+    try {
+        const response = await fetch(`${apiBase}${endpoint}`);
+        const payload = await response.json();
+        if (!response.ok) {
+            throw new Error(payload.detail || "Failed to open source folder.");
+        }
+
+        const folderPath = tab === "video" ? payload.video_source_dir : payload.audio_source_dir;
+        setStatus(tab, `Opened source folder: ${folderPath}`, "success");
     } catch (error) {
         setStatus(tab, error.message, "error");
     }
@@ -435,7 +472,9 @@ videoTabButton.addEventListener("click", () => setActiveTab("video"));
 refreshAudioButton.addEventListener("click", fetchTracks);
 refreshVideoButton.addEventListener("click", fetchVideos);
 renderButton.addEventListener("click", renderMix);
-masterVideoButton.addEventListener("click", generateVideoMaster);
+masterVideoButton.addEventListener("click", generateVideo);
+openSourceAudioButton.addEventListener("click", () => openSourceFolder("audio"));
+openSourceVideoButton.addEventListener("click", () => openSourceFolder("video"));
 openOutputAudioButton.addEventListener("click", () => openOutputFolder("audio"));
 openOutputVideoButton.addEventListener("click", () => openOutputFolder("video"));
 sortBpmButton.addEventListener("click", sortByBpm);

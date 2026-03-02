@@ -75,6 +75,7 @@ class GenerateVideoResponse(BaseModel):
 app = FastAPI(title="Flow88 Mix Engine API", version="0.1.0")
 PROJECT_ROOT = Path(__file__).resolve().parent
 FRONTEND_DIR = PROJECT_ROOT / "frontend"
+SOURCE_AUDIO_DIR = INPUT_DIR
 VIDEO_INPUT_DIR = INPUT_DIR / "videos"
 FINAL_VIDEO_AUDIO_FILENAME = "final_mix.wav"
 FINAL_VIDEO_OUTPUT_FILENAME = "flow88_final_video.mov"
@@ -261,3 +262,34 @@ def open_output() -> dict[str, str]:
         raise HTTPException(status_code=500, detail=f"Failed to open output directory: {exc}") from exc
 
     return {"status": "ok", "output_dir": str(resolved_output_dir)}
+
+
+@app.get("/open-audio-source")
+def open_audio_source() -> dict[str, str]:
+    ensure_runtime_directories()
+    resolved_audio_dir = SOURCE_AUDIO_DIR.resolve()
+
+    try:
+        os.startfile(str(resolved_audio_dir))
+    except AttributeError as exc:
+        raise HTTPException(status_code=501, detail="Opening folders is only supported on Windows.") from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to open source audio directory: {exc}") from exc
+
+    return {"status": "ok", "audio_source_dir": str(resolved_audio_dir)}
+
+
+@app.get("/open-video-source")
+def open_video_source() -> dict[str, str]:
+    ensure_runtime_directories()
+    VIDEO_INPUT_DIR.mkdir(parents=True, exist_ok=True)
+    resolved_video_dir = VIDEO_INPUT_DIR.resolve()
+
+    try:
+        os.startfile(str(resolved_video_dir))
+    except AttributeError as exc:
+        raise HTTPException(status_code=501, detail="Opening folders is only supported on Windows.") from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to open source video directory: {exc}") from exc
+
+    return {"status": "ok", "video_source_dir": str(resolved_video_dir)}

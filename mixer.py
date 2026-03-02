@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import logging
 import shutil
 import subprocess
 from pathlib import Path
 
 from models import TimelineEntry, TrackAnalysis
+from render_logging import log_structured
 
 
 DEFAULT_CROSSFADE_SECONDS = 15.0
@@ -92,10 +94,13 @@ def _build_filtergraph(track_data: list[TrackAnalysis], crossfade_seconds: float
 # FFmpeg Runner
 # -----------------------------
 
-def _run_ffmpeg(command: list[str], error_prefix: str) -> None:
+def _run_ffmpeg(command: list[str], error_prefix: str, logger: logging.Logger | None = None) -> None:
+    log_structured(logger, "ffmpeg_call", command=command, stage="audio_mix")
     try:
         subprocess.run(command, check=True, capture_output=True, text=True)
     except subprocess.CalledProcessError as exc:
+        if logger is not None:
+            logger.exception("Render failed")
         stderr = exc.stderr.strip() if exc.stderr else ""
         raise RuntimeError(f"{error_prefix}: {stderr}") from exc
 
@@ -118,6 +123,7 @@ def render_mix(
     track_data: list[TrackAnalysis],
     output_path: str | Path,
     crossfade_seconds: float = DEFAULT_CROSSFADE_SECONDS,
+    logger: logging.Logger | None = None,
 ) -> Path:
     if not track_data:
         raise ValueError("No tracks available.")
@@ -127,6 +133,13 @@ def render_mix(
 
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
+    log_structured(
+        logger,
+        "audio_render_start",
+        output_path=str(output.resolve()),
+        crossfade_seconds=crossfade_seconds,
+        tracks=[track.file_path.name for track in track_data],
+    )
 
     concat_file_path = output.parent / CONCAT_INPUTS_FILENAME
     _write_concat_inputs_file([track.file_path for track in track_data], concat_file_path)
@@ -153,9 +166,10 @@ def render_mix(
     ]
 
     try:
-        _run_ffmpeg(command, error_prefix="FFmpeg rendering failed")
+        _run_ffmpeg(command, error_prefix="FFmpeg rendering failed", logger=logger)
     finally:
         if concat_file_path.exists():
             concat_file_path.unlink(missing_ok=True)
 
+    log_structured(logger, "audio_render_complete", output_path=str(output.resolve()))
     return output

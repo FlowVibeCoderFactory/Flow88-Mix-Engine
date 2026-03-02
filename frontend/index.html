@@ -71,16 +71,22 @@
                 <div class="primary-actions">
                     <button id="refresh-video-button" class="refresh-button" type="button">Refresh</button>
                     <button id="master-video-button" class="render-button" type="button">Master Video</button>
+                    <button id="preview-video-button" class="secondary-action-button" type="button">Generate Preview</button>
                     <button id="open-source-video-button" class="secondary-action-button" type="button">Open Source Video</button>
                     <button id="open-output-video-button" class="secondary-action-button" type="button">Open Output Folder</button>
+                    <label class="profile-select-wrap" for="render-profile-select">
+                        <span>Render Tier</span>
+                        <select id="render-profile-select" class="profile-select"></select>
+                    </label>
                     <div class="sort-controls" role="group" aria-label="Video sort controls">
                         <button id="sort-video-az-button" class="sort-button" type="button">Sort A-Z</button>
                     </div>
                 </div>
                 <div class="status-wrap">
                     <p id="video-status" class="status">Loading videos...</p>
-                    <div id="video-progress" class="render-progress hidden" aria-hidden="true">
-                        <span class="render-progress-bar"></span>
+                    <p id="video-eta" class="status eta hidden"></p>
+                    <div id="video-progress" class="render-progress determinate hidden" aria-hidden="true">
+                        <span id="video-progress-bar" class="render-progress-bar"></span>
                     </div>
                 </div>
             </section>

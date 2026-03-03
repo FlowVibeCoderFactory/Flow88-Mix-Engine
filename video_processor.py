@@ -23,6 +23,9 @@ MAX_SCENE_SEGMENTS = 600
 PREVIEW_LOOP_FILENAME = "loop_preview.mp4"
 CHUNK_SIZE = 6
 CHUNK_CONCAT_FILENAME = "chunks.txt"
+SCENE_TIMELINE_FILENAME = "timeline.txt"
+SCENE_CONCAT_FILENAME = "temp_concat.mp4"
+PREFLIGHT_TIMELINE_FILENAME = "preflight_timeline.txt"
 LOOP_FILTER_SCRIPT_FILENAME = "loop_filter.txt"
 FINAL_FILTER_SCRIPT_FILENAME = "final_filter.txt"
 COMPOSITE_FILTER_SCRIPT_FILENAME = "composite_filter.txt"
@@ -77,6 +80,7 @@ class SceneSegment:
     file_path: Path
     duration_seconds: float
     loop_count: int = 1
+    concat_start_seconds: float = 0.0
 
 
 @dataclass(slots=True)
@@ -294,6 +298,39 @@ def _write_concat_inputs_file(input_paths: list[Path], concat_file_path: Path) -
     concat_file_path.write_text("\n".join(concat_lines) + "\n", encoding="utf-8")
 
 
+def _write_scene_timeline_file(scene_segments: list[SceneSegment], timeline_file_path: Path) -> None:
+    if not scene_segments:
+        raise ValueError("Cannot write timeline for an empty scene list.")
+
+    timeline_paths = [scene.file_path for scene in scene_segments]
+    _write_concat_inputs_file(timeline_paths, timeline_file_path)
+
+
+def _build_scene_concat_video(
+    scene_segments: list[SceneSegment],
+    timeline_file_path: Path,
+    concat_video_path: Path,
+    logger: logging.Logger | None = None,
+) -> Path:
+    _write_scene_timeline_file(scene_segments, timeline_file_path)
+
+    command = [
+        "ffmpeg",
+        "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        str(timeline_file_path),
+        "-c",
+        "copy",
+        str(concat_video_path),
+    ]
+    _run_command(command, error_prefix="Failed to build scene concat input", logger=logger)
+    return concat_video_path
+
+
 def _chunk_list(items: list, size: int) -> list[list]:
     if size <= 0:
         raise ValueError("Chunk size must be greater than zero.")
@@ -494,22 +531,23 @@ def _build_scene_sequence(
     if not seamless_clips:
         raise ValueError("No seamless clips provided for scene assembly.")
 
-    ordered_looped_clips: list[tuple[VideoAnalysis, int]] = []
+    validated_clips: list[tuple[VideoAnalysis, int]] = []
     for clip, loop_count in seamless_clips:
         if loop_count <= 0:
             raise ValueError(f"Invalid loop count for clip '{clip.file_path.name}': {loop_count}")
-        for _ in range(loop_count):
-            ordered_looped_clips.append((clip, loop_count))
+        validated_clips.append((clip, loop_count))
 
-    if not ordered_looped_clips:
+    if not validated_clips:
         raise ValueError("No seamless clips available after applying loop counts.")
 
     sequence: list[SceneSegment] = []
     assembled_duration = 0.0
+    concat_start_seconds = 0.0
     clip_index = 0
+    loop_repetitions_remaining = validated_clips[0][1]
 
     while assembled_duration < target_duration_seconds + crossfade_seconds:
-        clip, loop_count = ordered_looped_clips[clip_index % len(ordered_looped_clips)]
+        clip, loop_count = validated_clips[clip_index]
         clip_duration = clip.playable_duration_seconds
         if clip_duration <= crossfade_seconds:
             raise ValueError(
@@ -521,15 +559,20 @@ def _build_scene_sequence(
                 file_path=clip.file_path,
                 duration_seconds=clip_duration,
                 loop_count=loop_count,
+                concat_start_seconds=max(0.0, concat_start_seconds),
             )
         )
+        concat_start_seconds += clip_duration
 
         if len(sequence) == 1:
             assembled_duration += clip_duration
         else:
             assembled_duration += max(0.001, clip_duration - crossfade_seconds)
 
-        clip_index += 1
+        loop_repetitions_remaining -= 1
+        if loop_repetitions_remaining <= 0:
+            clip_index = (clip_index + 1) % len(validated_clips)
+            loop_repetitions_remaining = validated_clips[clip_index][1]
         if len(sequence) > MAX_SCENE_SEGMENTS:
             raise RuntimeError("Scene expansion exceeded safety limit while matching audio duration.")
 
@@ -544,9 +587,11 @@ def _build_scene_filtergraph(
 ) -> str:
     filter_parts: list[str] = []
     for index, scene in enumerate(scenes):
+        trim_start = max(0.0, scene.concat_start_seconds)
+        trim_end = trim_start + scene.duration_seconds
         chain_parts = [
+            f"trim=start={trim_start:.6f}:end={trim_end:.6f}",
             "setpts=PTS-STARTPTS",
-            f"trim=duration={scene.duration_seconds:.6f}",
             f"fps={settings.fps}",
         ]
         if settings.enable_scaling:
@@ -558,7 +603,7 @@ def _build_scene_filtergraph(
         if settings.enable_color_conversion:
             chain_parts.extend(["format=yuv420p", "setsar=1"])
 
-        filter_parts.append(f"[{index}:v]{','.join(chain_parts)}[v{index}]")
+        filter_parts.append(f"[0:v]{','.join(chain_parts)}[v{index}]")
 
     if len(scenes) == 1:
         filter_parts.append(f"[v0]trim=duration={target_duration_seconds:.6f},setpts=PTS-STARTPTS[vout]")
@@ -614,7 +659,9 @@ def _build_composite_filtergraph(
 
     for index, scene in enumerate(scenes):
         scene_duration = max(0.001, scene.duration_seconds)
-        scene_chain = f"[{index}:v]fps={settings.fps},"
+        trim_start = max(0.0, scene.concat_start_seconds)
+        trim_end = trim_start + scene_duration
+        scene_chain = f"[0:v]trim=start={trim_start:.6f}:end={trim_end:.6f},setpts=PTS-STARTPTS,fps={settings.fps},"
 
         if use_cuda:
             scene_chain += (
@@ -667,6 +714,7 @@ def _render_scene_chunk(
     chunk_scenes: list[SceneSegment],
     chunk_index: int,
     temporary_dir: Path,
+    concat_video_path: Path,
     encoder: str,
     settings: RenderSettings,
     chunk_target_duration: float,
@@ -692,10 +740,7 @@ def _render_scene_chunk(
     )
     _write_filter_script(filter_complex, filter_script_path)
 
-    command: list[str] = ["ffmpeg", "-y"]
-    for scene in chunk_scenes:
-        command.extend(["-i", str(scene.file_path)])
-
+    command: list[str] = ["ffmpeg", "-y", "-i", str(concat_video_path)]
     command.extend(
         [
             "-filter_complex_script",
@@ -763,6 +808,7 @@ def _render_scene_chunk(
 
 def _render_gpu_composite(
     scenes: list[SceneSegment],
+    concat_video_path: Path,
     audio_mix_path: Path,
     output_path: Path,
     temporary_dir: Path,
@@ -786,11 +832,16 @@ def _render_gpu_composite(
     )
     _write_filter_script(filter_complex, filter_script_path)
 
-    command: list[str] = ["ffmpeg", "-y"]
-    for scene in scenes:
-        command.extend(["-hwaccel", "cuda", "-hwaccel_output_format", "cuda", "-i", str(scene.file_path)])
-
-    audio_index = len(scenes)
+    command: list[str] = [
+        "ffmpeg",
+        "-y",
+        "-hwaccel",
+        "cuda",
+        "-hwaccel_output_format",
+        "cuda",
+        "-i",
+        str(concat_video_path),
+    ]
     command.extend(
         [
             "-i",
@@ -800,7 +851,7 @@ def _render_gpu_composite(
             "-map",
             "[vout]",
             "-map",
-            f"{audio_index}:a:0",
+            "1:a:0",
             "-r",
             str(settings.fps),
         ]
@@ -1034,6 +1085,7 @@ def _build_render_state_signature(
                     "file": scene.file_path.name,
                     "duration": round(scene.duration_seconds, 6),
                     "loop_count": scene.loop_count,
+                    "concat_start_seconds": round(scene.concat_start_seconds, 6),
                 }
                 for scene in chunk
             ]
@@ -1091,7 +1143,6 @@ def _save_render_state(
 def preflight_render_check(
     scene_segments: list[SceneSegment],
     *,
-    settings: RenderSettings,
     target_duration_seconds: float,
     scene_crossfade_seconds: float,
     temporary_dir: Path,
@@ -1159,35 +1210,29 @@ def preflight_render_check(
     if issues:
         raise RuntimeError("Preflight failed: " + " | ".join(issues))
 
-    preflight_filter_script = (temporary_dir / "preflight_filter.txt").resolve()
-    filter_complex = _build_scene_filtergraph(
-        scenes=scene_segments,
-        target_duration_seconds=target_duration_seconds,
-        crossfade_seconds=scene_crossfade_seconds,
-        settings=settings,
-    )
-    _write_filter_script(filter_complex, preflight_filter_script)
+    preflight_timeline_path = (temporary_dir / PREFLIGHT_TIMELINE_FILENAME).resolve()
+    _write_scene_timeline_file(scene_segments, preflight_timeline_path)
 
-    command: list[str] = ["ffmpeg", "-v", "error", "-y"]
-    for scene in scene_segments:
-        command.extend(["-i", str(scene.file_path)])
-    command.extend(
-        [
-            "-filter_complex_script",
-            str(preflight_filter_script),
-            "-map",
-            "[vout]",
-            "-f",
-            "null",
-            "-",
-        ]
-    )
+    command: list[str] = [
+        "ffmpeg",
+        "-v",
+        "error",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        str(preflight_timeline_path),
+        "-f",
+        "null",
+        "-",
+    ]
 
     try:
-        _run_command(command, error_prefix="Preflight dry-run failed", logger=logger)
+        _run_command(command, error_prefix="Preflight concat dry-run failed", logger=logger)
     finally:
-        if preflight_filter_script.exists():
-            preflight_filter_script.unlink(missing_ok=True)
+        if preflight_timeline_path.exists():
+            preflight_timeline_path.unlink(missing_ok=True)
 
     summary = {
         "target_duration_seconds": target_duration_seconds,
@@ -1229,7 +1274,6 @@ def run_render_preflight(
 
     preflight = preflight_render_check(
         scene_segments=scenes,
-        settings=settings,
         target_duration_seconds=target_duration_seconds,
         scene_crossfade_seconds=settings.crossfade_seconds,
         temporary_dir=temporary_dir,
@@ -1287,48 +1331,42 @@ def render_final_video(
     )
     preflight_render_check(
         scene_segments=scenes,
-        settings=settings,
         target_duration_seconds=target_duration_seconds,
         scene_crossfade_seconds=settings.crossfade_seconds,
         temporary_dir=temporary_dir,
         logger=logger,
     )
 
-    progress_state = RenderProgressState(
-        total_duration_seconds=target_duration_seconds,
-        start_time=time.time(),
-    )
-    gpu_ready = settings.mode != "preview" and detect_gpu_pipeline() and detect_h264_encoder() == "h264_nvenc"
-    log_structured(
-        logger,
-        "encoder_selection",
-        gpu_ready=gpu_ready,
-        mode=settings.mode,
+    scene_timeline_path = (temporary_dir / SCENE_TIMELINE_FILENAME).resolve()
+    scene_concat_path = (temporary_dir / SCENE_CONCAT_FILENAME).resolve()
+    _build_scene_concat_video(
+        scene_segments=scenes,
+        timeline_file_path=scene_timeline_path,
+        concat_video_path=scene_concat_path,
+        logger=logger,
     )
 
-    if settings.mode == "performance":
-        if not gpu_ready:
-            raise RuntimeError("Performance mode requires a CUDA/NVENC GPU, but no compatible GPU was detected.")
-        _render_gpu_composite(
-            scenes=scenes,
-            audio_mix_path=audio_mix_path,
-            output_path=output_path,
-            temporary_dir=temporary_dir,
-            target_duration_seconds=target_duration_seconds,
-            settings=settings,
-            progress_state=progress_state,
-            scene_crossfade_seconds=settings.crossfade_seconds,
-            on_progress=on_progress,
-            logger=logger,
+    render_completed = False
+
+    try:
+        progress_state = RenderProgressState(
+            total_duration_seconds=target_duration_seconds,
+            start_time=time.time(),
         )
-        log_structured(logger, "video_render_complete", encoder="h264_nvenc", output_path=str(output_path.resolve()))
-        return output_path, "h264_nvenc"
+        gpu_ready = settings.mode != "preview" and detect_gpu_pipeline() and detect_h264_encoder() == "h264_nvenc"
+        log_structured(
+            logger,
+            "encoder_selection",
+            gpu_ready=gpu_ready,
+            mode=settings.mode,
+        )
 
-    encoder = "h264_nvenc" if gpu_ready else DEFAULT_VIDEO_CODEC
-    if encoder == "h264_nvenc":
-        try:
+        if settings.mode == "performance":
+            if not gpu_ready:
+                raise RuntimeError("Performance mode requires a CUDA/NVENC GPU, but no compatible GPU was detected.")
             _render_gpu_composite(
                 scenes=scenes,
+                concat_video_path=scene_concat_path,
                 audio_mix_path=audio_mix_path,
                 output_path=output_path,
                 temporary_dir=temporary_dir,
@@ -1339,109 +1377,137 @@ def render_final_video(
                 on_progress=on_progress,
                 logger=logger,
             )
-            log_structured(logger, "video_render_complete", encoder=encoder, output_path=str(output_path.resolve()))
-            return output_path, encoder
-        except RuntimeError as exc:
-            print(f"GPU render failed in '{settings.mode}' mode. Falling back to CPU libx264: {exc}", file=sys.stderr)
-            log_structured(logger, "encoder_fallback", from_encoder="h264_nvenc", to_encoder=DEFAULT_VIDEO_CODEC)
-            encoder = DEFAULT_VIDEO_CODEC
-    else:
-        print(f"GPU unavailable. Falling back to CPU libx264 for '{settings.mode}' mode.", file=sys.stderr)
+            render_completed = True
+            log_structured(logger, "video_render_complete", encoder="h264_nvenc", output_path=str(output_path.resolve()))
+            return output_path, "h264_nvenc"
 
-    chunked_scenes = _chunk_list(scenes, CHUNK_SIZE)
-    chunk_paths: list[Path] = []
-    stitched_video_path: Path | None = None
-    chunk_concat_path = temporary_dir / CHUNK_CONCAT_FILENAME
-    stitched_intermediate_path = temporary_dir / "stitched_video.mp4"
-    state_path = temporary_dir / RENDER_STATE_FILENAME
-    state_signature = _build_render_state_signature(chunked_scenes, settings, target_duration_seconds)
-    completed_chunk_index = _load_render_state(state_path, state_signature, logger=logger)
-    render_completed = False
-    remaining_duration_seconds = target_duration_seconds
-    processed_duration_seconds = 0.0
+        encoder = "h264_nvenc" if gpu_ready else DEFAULT_VIDEO_CODEC
+        if encoder == "h264_nvenc":
+            try:
+                _render_gpu_composite(
+                    scenes=scenes,
+                    concat_video_path=scene_concat_path,
+                    audio_mix_path=audio_mix_path,
+                    output_path=output_path,
+                    temporary_dir=temporary_dir,
+                    target_duration_seconds=target_duration_seconds,
+                    settings=settings,
+                    progress_state=progress_state,
+                    scene_crossfade_seconds=settings.crossfade_seconds,
+                    on_progress=on_progress,
+                    logger=logger,
+                )
+                render_completed = True
+                log_structured(logger, "video_render_complete", encoder=encoder, output_path=str(output_path.resolve()))
+                return output_path, encoder
+            except RuntimeError as exc:
+                print(f"GPU render failed in '{settings.mode}' mode. Falling back to CPU libx264: {exc}", file=sys.stderr)
+                log_structured(logger, "encoder_fallback", from_encoder="h264_nvenc", to_encoder=DEFAULT_VIDEO_CODEC)
+                encoder = DEFAULT_VIDEO_CODEC
+        else:
+            print(f"GPU unavailable. Falling back to CPU libx264 for '{settings.mode}' mode.", file=sys.stderr)
 
-    try:
-        for chunk_index, chunk_scenes in enumerate(chunked_scenes):
-            if remaining_duration_seconds <= 0:
-                break
+        chunked_scenes = _chunk_list(scenes, CHUNK_SIZE)
+        chunk_paths: list[Path] = []
+        stitched_video_path: Path | None = None
+        chunk_concat_path = temporary_dir / CHUNK_CONCAT_FILENAME
+        stitched_intermediate_path = temporary_dir / "stitched_video.mp4"
+        state_path = temporary_dir / RENDER_STATE_FILENAME
+        state_signature = _build_render_state_signature(chunked_scenes, settings, target_duration_seconds)
+        completed_chunk_index = _load_render_state(state_path, state_signature, logger=logger)
+        cpu_render_completed = False
+        remaining_duration_seconds = target_duration_seconds
+        processed_duration_seconds = 0.0
 
-            full_chunk_duration = _assembled_duration_seconds(chunk_scenes, settings.crossfade_seconds)
-            chunk_target_duration = min(full_chunk_duration, remaining_duration_seconds)
-            if chunk_target_duration <= 0:
-                continue
+        try:
+            for chunk_index, chunk_scenes in enumerate(chunked_scenes):
+                if remaining_duration_seconds <= 0:
+                    break
 
-            existing_chunk_path = temporary_dir / f"chunk_{chunk_index:04d}.mp4"
-            if chunk_index <= completed_chunk_index and existing_chunk_path.exists():
-                chunk_paths.append(existing_chunk_path)
+                full_chunk_duration = _assembled_duration_seconds(chunk_scenes, settings.crossfade_seconds)
+                chunk_target_duration = min(full_chunk_duration, remaining_duration_seconds)
+                if chunk_target_duration <= 0:
+                    continue
+
+                existing_chunk_path = temporary_dir / f"chunk_{chunk_index:04d}.mp4"
+                if chunk_index <= completed_chunk_index and existing_chunk_path.exists():
+                    chunk_paths.append(existing_chunk_path)
+                    remaining_duration_seconds -= chunk_target_duration
+                    processed_duration_seconds += chunk_target_duration
+                    log_structured(
+                        logger,
+                        "chunk_resume_skip",
+                        chunk_index=chunk_index,
+                        chunk_path=str(existing_chunk_path.resolve()),
+                    )
+                    continue
+
+                chunk_path = _render_scene_chunk(
+                    chunk_scenes=chunk_scenes,
+                    chunk_index=chunk_index,
+                    temporary_dir=temporary_dir,
+                    concat_video_path=scene_concat_path,
+                    encoder=encoder,
+                    settings=settings,
+                    chunk_target_duration=chunk_target_duration,
+                    progress_state=progress_state,
+                    progress_offset_seconds=processed_duration_seconds,
+                    scene_crossfade_seconds=settings.crossfade_seconds,
+                    on_progress=on_progress,
+                    logger=logger,
+                    final_filter_filename=FINAL_FILTER_SCRIPT_FILENAME,
+                )
+                chunk_paths.append(chunk_path)
                 remaining_duration_seconds -= chunk_target_duration
                 processed_duration_seconds += chunk_target_duration
+                _save_render_state(state_path, completed_chunk_index=chunk_index, signature=state_signature, logger=logger)
+                completed_chunk_index = chunk_index
+
+            if not chunk_paths:
+                raise RuntimeError("No video chunks were rendered for final assembly.")
+
+            stitched_video_path = _stitch_chunks(
+                chunk_paths=chunk_paths,
+                chunk_concat_path=chunk_concat_path,
+                stitched_video_path=stitched_intermediate_path,
+                logger=logger,
+            )
+            _mux_audio_once(
+                stitched_video_path=stitched_video_path,
+                audio_mix_path=audio_mix_path,
+                output_path=output_path,
+                logger=logger,
+            )
+            cpu_render_completed = True
+            render_completed = True
+            log_structured(logger, "video_render_complete", encoder=encoder, output_path=str(output_path.resolve()))
+        finally:
+            if chunk_concat_path.exists():
+                chunk_concat_path.unlink(missing_ok=True)
+
+            if cpu_render_completed and state_path.exists():
+                state_path.unlink(missing_ok=True)
+            elif not cpu_render_completed:
                 log_structured(
                     logger,
-                    "chunk_resume_skip",
-                    chunk_index=chunk_index,
-                    chunk_path=str(existing_chunk_path.resolve()),
+                    "resume_state_retained",
+                    state_path=str(state_path.resolve()),
+                    completed_chunk_index=completed_chunk_index,
                 )
-                continue
 
-            chunk_path = _render_scene_chunk(
-                chunk_scenes=chunk_scenes,
-                chunk_index=chunk_index,
-                temporary_dir=temporary_dir,
-                encoder=encoder,
-                settings=settings,
-                chunk_target_duration=chunk_target_duration,
-                progress_state=progress_state,
-                progress_offset_seconds=processed_duration_seconds,
-                scene_crossfade_seconds=settings.crossfade_seconds,
-                on_progress=on_progress,
-                logger=logger,
-                final_filter_filename=FINAL_FILTER_SCRIPT_FILENAME,
-            )
-            chunk_paths.append(chunk_path)
-            remaining_duration_seconds -= chunk_target_duration
-            processed_duration_seconds += chunk_target_duration
-            _save_render_state(state_path, completed_chunk_index=chunk_index, signature=state_signature, logger=logger)
-            completed_chunk_index = chunk_index
+            if cpu_render_completed and not keep_intermediate_files:
+                for chunk_path in chunk_paths:
+                    if chunk_path.exists():
+                        chunk_path.unlink(missing_ok=True)
 
-        if not chunk_paths:
-            raise RuntimeError("No video chunks were rendered for final assembly.")
+                if stitched_video_path is not None and stitched_video_path.exists() and stitched_video_path not in chunk_paths:
+                    stitched_video_path.unlink(missing_ok=True)
+                elif stitched_video_path is None and stitched_intermediate_path.exists():
+                    stitched_intermediate_path.unlink(missing_ok=True)
 
-        stitched_video_path = _stitch_chunks(
-            chunk_paths=chunk_paths,
-            chunk_concat_path=chunk_concat_path,
-            stitched_video_path=stitched_intermediate_path,
-            logger=logger,
-        )
-        _mux_audio_once(
-            stitched_video_path=stitched_video_path,
-            audio_mix_path=audio_mix_path,
-            output_path=output_path,
-            logger=logger,
-        )
-        render_completed = True
-        log_structured(logger, "video_render_complete", encoder=encoder, output_path=str(output_path.resolve()))
+        return output_path, encoder
     finally:
-        if chunk_concat_path.exists():
-            chunk_concat_path.unlink(missing_ok=True)
-
-        if render_completed and state_path.exists():
-            state_path.unlink(missing_ok=True)
-        elif not render_completed:
-            log_structured(
-                logger,
-                "resume_state_retained",
-                state_path=str(state_path.resolve()),
-                completed_chunk_index=completed_chunk_index,
-            )
-
-        if render_completed and not keep_intermediate_files:
-            for chunk_path in chunk_paths:
-                if chunk_path.exists():
-                    chunk_path.unlink(missing_ok=True)
-
-            if stitched_video_path is not None and stitched_video_path.exists() and stitched_video_path not in chunk_paths:
-                stitched_video_path.unlink(missing_ok=True)
-            elif stitched_video_path is None and stitched_intermediate_path.exists():
-                stitched_intermediate_path.unlink(missing_ok=True)
-
-    return output_path, encoder
+        if scene_timeline_path.exists():
+            scene_timeline_path.unlink(missing_ok=True)
+        if render_completed and not keep_intermediate_files and scene_concat_path.exists():
+            scene_concat_path.unlink(missing_ok=True)

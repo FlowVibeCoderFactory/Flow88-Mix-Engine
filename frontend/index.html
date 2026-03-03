@@ -78,6 +78,38 @@
                         <span>Render Tier</span>
                         <select id="render-profile-select" class="profile-select"></select>
                     </label>
+                    <label class="profile-select-wrap" for="transition-type-select">
+                        <span>Transition</span>
+                        <select id="transition-type-select" class="profile-select">
+                            <option value="fade">fade</option>
+                            <option value="wipeleft">wipeleft</option>
+                            <option value="wiperight">wiperight</option>
+                            <option value="slideleft">slideleft</option>
+                            <option value="slideright">slideright</option>
+                            <option value="circleopen">circleopen</option>
+                            <option value="circleclose">circleclose</option>
+                        </select>
+                    </label>
+                    <label class="transition-duration-wrap" for="transition-duration-range">
+                        <span>Duration <strong id="transition-duration-value">1.0s</strong></span>
+                        <input
+                            id="transition-duration-range"
+                            class="transition-duration-range"
+                            type="range"
+                            min="0.2"
+                            max="3"
+                            step="0.1"
+                            value="1.0"
+                        >
+                    </label>
+                    <label class="profile-select-wrap" for="transition-curve-select">
+                        <span>Curve</span>
+                        <select id="transition-curve-select" class="profile-select">
+                            <option value="linear">linear</option>
+                            <option value="easein">easein</option>
+                            <option value="easeout">easeout</option>
+                        </select>
+                    </label>
                     <div class="sort-controls" role="group" aria-label="Video sort controls">
                         <button id="sort-video-az-button" class="sort-button" type="button">Sort A-Z</button>
                     </div>

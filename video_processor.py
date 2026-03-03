@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import shutil
 import subprocess
 import sys
@@ -24,22 +25,29 @@ PREVIEW_LOOP_FILENAME = "loop_preview.mp4"
 CHUNK_SIZE = 6
 CHUNK_CONCAT_FILENAME = "chunks.txt"
 SCENE_TIMELINE_FILENAME = "timeline.txt"
-SCENE_CONCAT_FILENAME = "temp_concat.mp4"
 PREFLIGHT_TIMELINE_FILENAME = "preflight_timeline.txt"
 LOOP_FILTER_SCRIPT_FILENAME = "loop_filter.txt"
-FINAL_FILTER_SCRIPT_FILENAME = "final_filter.txt"
-COMPOSITE_FILTER_SCRIPT_FILENAME = "composite_filter.txt"
+TRANSITION_GRAPH_FILENAME = "transition_graph.txt"
+PREFLIGHT_TRANSITION_GRAPH_FILENAME = "preflight_transition_graph.txt"
 RENDER_STATE_FILENAME = "render_state.json"
 MAX_PREVIEW_TIMELINE_SECONDS = 60.0
 PREVIEW_OUTPUT_FILENAME = "output_preview.mp4"
 DEFAULT_RENDER_PROFILE = "balanced"
+DEFAULT_TRANSITION_ENABLED = True
+DEFAULT_TRANSITION_TYPE = "fade"
+DEFAULT_TRANSITION_DURATION_SECONDS = 1.0
+DEFAULT_TRANSITION_CURVE = "linear"
+MIN_TRANSITION_DURATION_SECONDS = 0.2
+MAX_TRANSITION_DURATION_SECONDS = 3.0
+SUPPORTED_TRANSITION_CURVES = {"linear", "easein", "easeout"}
+TRANSITION_TYPE_PATTERN = re.compile(r"^[A-Za-z0-9_]+$")
 RENDER_PROFILES = {
     "preview": {
         "fps": 12,
         "resolution": (640, 360),
         "nvenc_preset": "p1",
         "cq": 35,
-        "crossfade": 0.5,
+        "crossfade": 1.0,
     },
     "performance": {
         "fps": 24,
@@ -53,14 +61,14 @@ RENDER_PROFILES = {
         "resolution": (3840, 2160),
         "nvenc_preset": "p5",
         "cq": 19,
-        "crossfade": 2.0,
+        "crossfade": 1.0,
     },
     "quality": {
         "fps": 30,
         "resolution": (3840, 2160),
         "nvenc_preset": "p7",
         "cq": 16,
-        "crossfade": 2.0,
+        "crossfade": 1.0,
     },
 }
 
@@ -91,12 +99,26 @@ class RenderProgressState:
 
 
 @dataclass(slots=True, frozen=True)
+class TransitionConfig:
+    enabled: bool = DEFAULT_TRANSITION_ENABLED
+    transition_type: str = DEFAULT_TRANSITION_TYPE
+    duration_seconds: float = DEFAULT_TRANSITION_DURATION_SECONDS
+    curve: str = DEFAULT_TRANSITION_CURVE
+
+    @property
+    def overlap_seconds(self) -> float:
+        if not self.enabled:
+            return 0.0
+        return max(0.0, self.duration_seconds)
+
+
+@dataclass(slots=True, frozen=True)
 class RenderSettings:
     mode: str
     width: int
     height: int
     fps: int
-    crossfade_seconds: float
+    transition: TransitionConfig
     nvenc_preset: str
     cq: int
     enable_scaling: bool = True
@@ -105,6 +127,10 @@ class RenderSettings:
     preview_timeline_limit_seconds: float | None = None
     cpu_preset: str = "medium"
     cpu_crf: int = 18
+
+    @property
+    def transition_overlap_seconds(self) -> float:
+        return self.transition.overlap_seconds
 
 
 def discover_video_files(input_dir: Path) -> list[Path]:
@@ -170,6 +196,99 @@ def _parse_fraction(value: object) -> float | None:
         return numerator / denominator
 
     return _parse_float(text)
+
+
+def _parse_bool(value: object, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return bool(value)
+
+
+def _normalize_transition_type(value: object) -> str:
+    transition_type = str(value or DEFAULT_TRANSITION_TYPE).strip().lower()
+    if not transition_type:
+        transition_type = DEFAULT_TRANSITION_TYPE
+    if not TRANSITION_TYPE_PATTERN.fullmatch(transition_type):
+        raise ValueError(
+            f"Invalid transition type '{transition_type}'. Use letters, numbers, and underscores only."
+        )
+    return transition_type
+
+
+def _normalize_transition_curve(value: object) -> str:
+    curve = str(value or DEFAULT_TRANSITION_CURVE).strip().lower()
+    if not curve:
+        curve = DEFAULT_TRANSITION_CURVE
+    if curve not in SUPPORTED_TRANSITION_CURVES:
+        raise ValueError(
+            f"Invalid transition curve '{curve}'. Supported: {', '.join(sorted(SUPPORTED_TRANSITION_CURVES))}."
+        )
+    return curve
+
+
+def _normalize_transition_duration(value: object) -> float:
+    duration = _parse_float(value)
+    if duration is None:
+        raise ValueError("Transition duration must be a positive number.")
+    if duration < MIN_TRANSITION_DURATION_SECONDS or duration > MAX_TRANSITION_DURATION_SECONDS:
+        raise ValueError(
+            f"Transition duration must be between {MIN_TRANSITION_DURATION_SECONDS:.1f}s and "
+            f"{MAX_TRANSITION_DURATION_SECONDS:.1f}s."
+        )
+    return float(duration)
+
+
+def _normalize_transition_config(transition: TransitionConfig | dict[str, object] | None) -> TransitionConfig:
+    if isinstance(transition, TransitionConfig):
+        return transition
+
+    if transition is None:
+        payload: dict[str, object] = {}
+    elif isinstance(transition, dict):
+        payload = transition
+    else:
+        raise ValueError("Transition config must be a dictionary with enabled/type/duration/curve fields.")
+
+    enabled = _parse_bool(payload.get("enabled"), DEFAULT_TRANSITION_ENABLED)
+    transition_type = _normalize_transition_type(payload.get("type"))
+    duration_seconds = _normalize_transition_duration(payload.get("duration", DEFAULT_TRANSITION_DURATION_SECONDS))
+    curve = _normalize_transition_curve(payload.get("curve"))
+    return TransitionConfig(
+        enabled=enabled,
+        transition_type=transition_type,
+        duration_seconds=duration_seconds,
+        curve=curve,
+    )
+
+
+def _apply_mode_transition_adjustments(transition: TransitionConfig, mode: str) -> TransitionConfig:
+    if mode != "preview" or not transition.enabled:
+        return transition
+
+    return TransitionConfig(
+        enabled=True,
+        transition_type=transition.transition_type,
+        duration_seconds=max(0.001, transition.duration_seconds * 0.5),
+        curve=transition.curve,
+    )
+
+
+def _resolve_xfade_transition_name(transition: TransitionConfig) -> str:
+    if transition.transition_type != "fade":
+        return transition.transition_type
+    if transition.curve == "easein":
+        return "fadeslow"
+    if transition.curve == "easeout":
+        return "fadefast"
+    return "fade"
 
 
 def _run_command(command: list[str], error_prefix: str, logger: logging.Logger | None = None) -> str:
@@ -306,44 +425,19 @@ def _write_scene_timeline_file(scene_segments: list[SceneSegment], timeline_file
     _write_concat_inputs_file(timeline_paths, timeline_file_path)
 
 
-def _build_scene_concat_video(
-    scene_segments: list[SceneSegment],
-    timeline_file_path: Path,
-    concat_video_path: Path,
-    logger: logging.Logger | None = None,
-) -> Path:
-    _write_scene_timeline_file(scene_segments, timeline_file_path)
-
-    command = [
-        "ffmpeg",
-        "-y",
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        str(timeline_file_path),
-        "-c",
-        "copy",
-        str(concat_video_path),
-    ]
-    _run_command(command, error_prefix="Failed to build scene concat input", logger=logger)
-    return concat_video_path
-
-
 def _chunk_list(items: list, size: int) -> list[list]:
     if size <= 0:
         raise ValueError("Chunk size must be greater than zero.")
     return [items[index : index + size] for index in range(0, len(items), size)]
 
 
-def _assembled_duration_seconds(scenes: list[SceneSegment], crossfade_seconds: float) -> float:
+def _assembled_duration_seconds(scenes: list[SceneSegment], transition_overlap_seconds: float) -> float:
     if not scenes:
         return 0.0
 
     total_duration = scenes[0].duration_seconds
     for scene in scenes[1:]:
-        total_duration += max(0.001, scene.duration_seconds - crossfade_seconds)
+        total_duration += max(0.001, scene.duration_seconds - transition_overlap_seconds)
     return max(0.0, total_duration)
 
 
@@ -526,10 +620,12 @@ def make_seamless_loop_clip(
 def _build_scene_sequence(
     seamless_clips: list[tuple[VideoAnalysis, int]],
     target_duration_seconds: float,
-    crossfade_seconds: float,
+    transition_overlap_seconds: float,
 ) -> list[SceneSegment]:
     if not seamless_clips:
         raise ValueError("No seamless clips provided for scene assembly.")
+    if transition_overlap_seconds < 0:
+        raise ValueError("Transition overlap seconds cannot be negative.")
 
     validated_clips: list[tuple[VideoAnalysis, int]] = []
     for clip, loop_count in seamless_clips:
@@ -546,12 +642,12 @@ def _build_scene_sequence(
     clip_index = 0
     loop_repetitions_remaining = validated_clips[0][1]
 
-    while assembled_duration < target_duration_seconds + crossfade_seconds:
+    while assembled_duration < target_duration_seconds + transition_overlap_seconds:
         clip, loop_count = validated_clips[clip_index]
         clip_duration = clip.playable_duration_seconds
-        if clip_duration <= crossfade_seconds:
+        if transition_overlap_seconds > 0 and clip_duration <= transition_overlap_seconds:
             raise ValueError(
-                f"Clip '{clip.file_path.name}' is too short for {crossfade_seconds:.1f}s scene crossfades."
+                f"Clip '{clip.file_path.name}' is too short for a {transition_overlap_seconds:.1f}s transition overlap."
             )
 
         sequence.append(
@@ -567,7 +663,7 @@ def _build_scene_sequence(
         if len(sequence) == 1:
             assembled_duration += clip_duration
         else:
-            assembled_duration += max(0.001, clip_duration - crossfade_seconds)
+            assembled_duration += max(0.001, clip_duration - transition_overlap_seconds)
 
         loop_repetitions_remaining -= 1
         if loop_repetitions_remaining <= 0:
@@ -582,10 +678,17 @@ def _build_scene_sequence(
 def _build_scene_filtergraph(
     scenes: list[SceneSegment],
     target_duration_seconds: float,
-    crossfade_seconds: float,
+    transition: TransitionConfig,
     settings: RenderSettings,
 ) -> str:
+    if not scenes:
+        raise ValueError("Cannot build a scene filtergraph without scenes.")
+
     filter_parts: list[str] = []
+    if len(scenes) > 1:
+        split_labels = "".join(f"[src{index}]" for index in range(len(scenes)))
+        filter_parts.append(f"[0:v]split={len(scenes)}{split_labels}")
+
     for index, scene in enumerate(scenes):
         trim_start = max(0.0, scene.concat_start_seconds)
         trim_end = trim_start + scene.duration_seconds
@@ -603,22 +706,29 @@ def _build_scene_filtergraph(
         if settings.enable_color_conversion:
             chain_parts.extend(["format=yuv420p", "setsar=1"])
 
-        filter_parts.append(f"[0:v]{','.join(chain_parts)}[v{index}]")
+        source_label = f"src{index}" if len(scenes) > 1 else "0:v"
+        filter_parts.append(f"[{source_label}]{','.join(chain_parts)}[v{index}]")
 
     if len(scenes) == 1:
         filter_parts.append(f"[v0]trim=duration={target_duration_seconds:.6f},setpts=PTS-STARTPTS[vout]")
         return ";".join(filter_parts)
 
-    running_duration = scenes[0].duration_seconds
-    current_label = "v0"
+    if not transition.enabled or transition.overlap_seconds <= 0:
+        concat_inputs = "".join(f"[v{index}]" for index in range(len(scenes)))
+        filter_parts.append(f"{concat_inputs}concat=n={len(scenes)}:v=1:a=0[vcat]")
+        filter_parts.append(f"[vcat]trim=duration={target_duration_seconds:.6f},setpts=PTS-STARTPTS[vout]")
+        return ";".join(filter_parts)
 
+    transition_name = _resolve_xfade_transition_name(transition)
+    cumulative_previous_duration = 0.0
+    current_label = "v0"
     for index in range(1, len(scenes)):
         next_label = f"x{index}"
-        xfade_offset = max(0.0, running_duration - crossfade_seconds)
+        cumulative_previous_duration += scenes[index - 1].duration_seconds
+        xfade_offset = max(0.0, cumulative_previous_duration - (transition.duration_seconds * index))
         filter_parts.append(
-            f"[{current_label}][v{index}]xfade=transition=fade:duration={crossfade_seconds:.6f}:offset={xfade_offset:.6f}[{next_label}]"
+            f"[{current_label}][v{index}]xfade=transition={transition_name}:duration={transition.duration_seconds:.6f}:offset={xfade_offset:.6f}[{next_label}]"
         )
-        running_duration += max(0.001, scenes[index].duration_seconds - crossfade_seconds)
         current_label = next_label
 
     filter_parts.append(
@@ -627,103 +737,20 @@ def _build_scene_filtergraph(
     return ";".join(filter_parts)
 
 
-def _build_composite_filtergraph(
-    scenes: list[SceneSegment],
-    crossfade_seconds: float,
-    target_duration_seconds: float,
-    settings: RenderSettings,
-    use_cuda: bool = True,
-) -> str:
-    if not scenes:
-        raise ValueError("Cannot build a composite filtergraph without scenes.")
-
-    filter_parts: list[str] = []
-    start_offsets: list[float] = []
-    running_offset = 0.0
-
-    for index, scene in enumerate(scenes):
-        start_offsets.append(max(0.0, running_offset))
-        if index < len(scenes) - 1:
-            running_offset += max(0.001, scene.duration_seconds - crossfade_seconds)
-
-    if use_cuda:
-        filter_parts.append(
-            f"color=c=black:s={settings.width}x{settings.height}:r={settings.fps}:d={target_duration_seconds:.6f},"
-            "format=rgba,hwupload_cuda[base]"
-        )
-    else:
-        filter_parts.append(
-            f"color=c=black:s={settings.width}x{settings.height}:r={settings.fps}:d={target_duration_seconds:.6f},"
-            "format=rgba[base]"
-        )
-
-    for index, scene in enumerate(scenes):
-        scene_duration = max(0.001, scene.duration_seconds)
-        trim_start = max(0.0, scene.concat_start_seconds)
-        trim_end = trim_start + scene_duration
-        scene_chain = f"[0:v]trim=start={trim_start:.6f}:end={trim_end:.6f},setpts=PTS-STARTPTS,fps={settings.fps},"
-
-        if use_cuda:
-            scene_chain += (
-                f"scale_cuda={settings.width}:{settings.height}:force_original_aspect_ratio=decrease,"
-                "hwdownload,format=rgba,"
-            )
-        else:
-            scene_chain += (
-                f"scale={settings.width}:{settings.height}:force_original_aspect_ratio=decrease,"
-                "format=rgba,"
-            )
-
-        scene_chain += f"pad={settings.width}:{settings.height}:(ow-iw)/2:(oh-ih)/2:color=black,"
-
-        if index > 0:
-            scene_chain += f"fade=t=in:st=0:d={crossfade_seconds:.6f}:alpha=1,"
-        if index < len(scenes) - 1:
-            fade_out_start = max(0.0, scene_duration - crossfade_seconds)
-            scene_chain += f"fade=t=out:st={fade_out_start:.6f}:d={crossfade_seconds:.6f}:alpha=1,"
-
-        scene_chain += f"setpts=PTS-STARTPTS+{start_offsets[index]:.6f}/TB"
-        if use_cuda:
-            scene_chain += ",hwupload_cuda"
-
-        scene_chain += f"[v{index}]"
-        filter_parts.append(scene_chain)
-
-    current_label = "base"
-    for index in range(len(scenes)):
-        output_label = f"cmp{index}"
-        if use_cuda:
-            filter_parts.append(f"[{current_label}][v{index}]overlay_cuda=x=0:y=0[{output_label}]")
-        else:
-            filter_parts.append(f"[{current_label}][v{index}]overlay=x=0:y=0:format=auto[{output_label}]")
-        current_label = output_label
-
-    if use_cuda:
-        filter_parts.append(
-            f"[{current_label}]hwdownload,format=yuv420p,trim=duration={target_duration_seconds:.6f},setpts=PTS-STARTPTS[vout]"
-        )
-    else:
-        filter_parts.append(
-            f"[{current_label}]format=yuv420p,trim=duration={target_duration_seconds:.6f},setpts=PTS-STARTPTS[vout]"
-        )
-
-    return ";".join(filter_parts)
-
-
 def _render_scene_chunk(
     chunk_scenes: list[SceneSegment],
     chunk_index: int,
     temporary_dir: Path,
-    concat_video_path: Path,
+    timeline_file_path: Path,
     encoder: str,
     settings: RenderSettings,
     chunk_target_duration: float,
     progress_state: RenderProgressState,
     progress_offset_seconds: float,
-    scene_crossfade_seconds: float,
+    transition: TransitionConfig,
     on_progress: Callable[[float, float], None] | None,
     logger: logging.Logger | None = None,
-    final_filter_filename: str = FINAL_FILTER_SCRIPT_FILENAME,
+    final_filter_filename: str = TRANSITION_GRAPH_FILENAME,
 ) -> Path:
     if not chunk_scenes:
         raise ValueError("Cannot render an empty scene chunk.")
@@ -735,12 +762,21 @@ def _render_scene_chunk(
     filter_complex = _build_scene_filtergraph(
         scenes=chunk_scenes,
         target_duration_seconds=chunk_target_duration,
-        crossfade_seconds=scene_crossfade_seconds,
+        transition=transition,
         settings=settings,
     )
     _write_filter_script(filter_complex, filter_script_path)
 
-    command: list[str] = ["ffmpeg", "-y", "-i", str(concat_video_path)]
+    command: list[str] = [
+        "ffmpeg",
+        "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        str(timeline_file_path),
+    ]
     command.extend(
         [
             "-filter_complex_script",
@@ -804,100 +840,6 @@ def _render_scene_chunk(
             filter_script_path.unlink(missing_ok=True)
 
     return output_chunk_path
-
-
-def _render_gpu_composite(
-    scenes: list[SceneSegment],
-    concat_video_path: Path,
-    audio_mix_path: Path,
-    output_path: Path,
-    temporary_dir: Path,
-    target_duration_seconds: float,
-    settings: RenderSettings,
-    progress_state: RenderProgressState,
-    scene_crossfade_seconds: float,
-    on_progress: Callable[[float, float], None] | None,
-    logger: logging.Logger | None = None,
-) -> None:
-    if not scenes:
-        raise ValueError("Cannot render GPU composite output without scenes.")
-
-    filter_script_path = (temporary_dir / COMPOSITE_FILTER_SCRIPT_FILENAME).resolve()
-    filter_complex = _build_composite_filtergraph(
-        scenes=scenes,
-        crossfade_seconds=scene_crossfade_seconds,
-        target_duration_seconds=target_duration_seconds,
-        settings=settings,
-        use_cuda=True,
-    )
-    _write_filter_script(filter_complex, filter_script_path)
-
-    command: list[str] = [
-        "ffmpeg",
-        "-y",
-        "-hwaccel",
-        "cuda",
-        "-hwaccel_output_format",
-        "cuda",
-        "-i",
-        str(concat_video_path),
-    ]
-    command.extend(
-        [
-            "-i",
-            str(audio_mix_path),
-            "-filter_complex_script",
-            str(filter_script_path),
-            "-map",
-            "[vout]",
-            "-map",
-            "1:a:0",
-            "-r",
-            str(settings.fps),
-        ]
-    )
-    if settings.enable_color_conversion:
-        command.extend(["-pix_fmt", "yuv420p"])
-    command.extend(
-        [
-            "-c:v",
-            "h264_nvenc",
-            "-preset",
-            settings.nvenc_preset,
-            "-rc",
-            "vbr",
-            "-cq",
-            str(settings.cq),
-            "-b:v",
-            "0",
-            "-c:a",
-            DEFAULT_AUDIO_CODEC,
-            "-shortest",
-            "-progress",
-            "pipe:1",
-            "-nostats",
-            str(output_path),
-        ]
-    )
-
-    try:
-        try:
-            _run_ffmpeg_with_progress(
-                command=command,
-                error_prefix="GPU composite render failed",
-                progress_state=progress_state,
-                progress_offset_seconds=0.0,
-                progress_span_seconds=target_duration_seconds,
-                on_progress=on_progress,
-                logger=logger,
-            )
-        except Exception:
-            if logger is not None:
-                logger.exception("Render failed")
-            raise
-    finally:
-        if filter_script_path.exists():
-            filter_script_path.unlink(missing_ok=True)
 
 
 def _stitch_chunks(
@@ -995,21 +937,38 @@ def _normalize_ordered_video_inputs(
     return normalized_videos
 
 
-def _build_render_settings(render_profile: str, scene_crossfade_seconds: float | None) -> RenderSettings:
+def _build_render_settings(
+    render_profile: str,
+    scene_crossfade_seconds: float | None,
+    transition_config: TransitionConfig | dict[str, object] | None = None,
+) -> RenderSettings:
     mode, profile = _resolve_render_profile(render_profile)
     fps = int(profile["fps"])
     width, height = profile["resolution"]
-    crossfade_seconds = float(profile["crossfade"]) if scene_crossfade_seconds is None else float(scene_crossfade_seconds)
-    if crossfade_seconds <= 0:
-        raise ValueError("Scene crossfade seconds must be greater than zero.")
+    if transition_config is None:
+        transition = TransitionConfig(duration_seconds=float(profile["crossfade"]))
+    else:
+        transition = _normalize_transition_config(transition_config)
+
+    if scene_crossfade_seconds is not None:
+        overridden_duration = float(scene_crossfade_seconds)
+        if overridden_duration <= 0:
+            raise ValueError("Scene crossfade seconds must be greater than zero.")
+        transition = TransitionConfig(
+            enabled=True,
+            transition_type=transition.transition_type,
+            duration_seconds=overridden_duration,
+            curve=transition.curve,
+        )
 
     preview_mode = mode == "preview"
+    mode_transition = _apply_mode_transition_adjustments(transition, mode)
     return RenderSettings(
         mode=mode,
         width=int(width),
         height=int(height),
         fps=fps,
-        crossfade_seconds=crossfade_seconds,
+        transition=mode_transition,
         nvenc_preset=str(profile["nvenc_preset"]),
         cq=int(profile["cq"]),
         enable_scaling=not preview_mode,
@@ -1060,7 +1019,7 @@ def _prepare_scene_segments(
     scenes = _build_scene_sequence(
         seamless_clips=seamless_clips,
         target_duration_seconds=target_duration_seconds,
-        crossfade_seconds=settings.crossfade_seconds,
+        transition_overlap_seconds=settings.transition_overlap_seconds,
     )
     if not scenes:
         raise RuntimeError("Scene expansion did not produce any renderable scenes.")
@@ -1077,7 +1036,12 @@ def _build_render_state_signature(
         "mode": settings.mode,
         "fps": settings.fps,
         "resolution": [settings.width, settings.height],
-        "crossfade_seconds": settings.crossfade_seconds,
+        "transition": {
+            "enabled": settings.transition.enabled,
+            "type": settings.transition.transition_type,
+            "duration_seconds": round(settings.transition.duration_seconds, 6),
+            "curve": settings.transition.curve,
+        },
         "target_duration_seconds": round(target_duration_seconds, 6),
         "chunks": [
             [
@@ -1144,7 +1108,7 @@ def preflight_render_check(
     scene_segments: list[SceneSegment],
     *,
     target_duration_seconds: float,
-    scene_crossfade_seconds: float,
+    settings: RenderSettings,
     temporary_dir: Path,
     logger: logging.Logger | None = None,
 ) -> dict[str, object]:
@@ -1187,9 +1151,12 @@ def preflight_render_check(
     if duration_mismatches:
         issues.append("Duration consistency mismatch: " + ", ".join(duration_mismatches[:5]))
 
-    if any(scene.duration_seconds <= scene_crossfade_seconds for scene in scene_segments):
+    transition_overlap_seconds = settings.transition_overlap_seconds
+    if transition_overlap_seconds > 0 and any(
+        scene.duration_seconds <= transition_overlap_seconds for scene in scene_segments
+    ):
         issues.append(
-            f"Crossfade compatibility failure: at least one scene is shorter than {scene_crossfade_seconds:.2f}s."
+            f"Transition compatibility failure: at least one scene is shorter than {transition_overlap_seconds:.2f}s."
         )
 
     if len(resolutions) > 1:
@@ -1201,7 +1168,7 @@ def preflight_render_check(
     if missing_streams:
         issues.append("Missing streams: " + ", ".join(missing_streams))
 
-    assembled_duration = _assembled_duration_seconds(scene_segments, scene_crossfade_seconds)
+    assembled_duration = _assembled_duration_seconds(scene_segments, transition_overlap_seconds)
     if assembled_duration + 0.25 < target_duration_seconds:
         issues.append(
             f"Duration consistency failure: assembled timeline {assembled_duration:.2f}s shorter than target {target_duration_seconds:.2f}s."
@@ -1211,9 +1178,10 @@ def preflight_render_check(
         raise RuntimeError("Preflight failed: " + " | ".join(issues))
 
     preflight_timeline_path = (temporary_dir / PREFLIGHT_TIMELINE_FILENAME).resolve()
+    preflight_transition_graph_path = (temporary_dir / PREFLIGHT_TRANSITION_GRAPH_FILENAME).resolve()
     _write_scene_timeline_file(scene_segments, preflight_timeline_path)
 
-    command: list[str] = [
+    concat_dry_run_command: list[str] = [
         "ffmpeg",
         "-v",
         "error",
@@ -1228,17 +1196,56 @@ def preflight_render_check(
         "-",
     ]
 
+    transition_graph = _build_scene_filtergraph(
+        scenes=scene_segments,
+        target_duration_seconds=target_duration_seconds,
+        transition=settings.transition,
+        settings=settings,
+    )
+    _write_filter_script(transition_graph, preflight_transition_graph_path)
+
+    transition_graph_dry_run_command: list[str] = [
+        "ffmpeg",
+        "-v",
+        "error",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        str(preflight_timeline_path),
+        "-filter_complex_script",
+        str(preflight_transition_graph_path),
+        "-map",
+        "[vout]",
+        "-an",
+        "-f",
+        "null",
+        "-",
+    ]
+
     try:
-        _run_command(command, error_prefix="Preflight concat dry-run failed", logger=logger)
+        _run_command(concat_dry_run_command, error_prefix="Preflight concat dry-run failed", logger=logger)
+        _run_command(
+            transition_graph_dry_run_command,
+            error_prefix="Preflight transition graph validation failed",
+            logger=logger,
+        )
     finally:
         if preflight_timeline_path.exists():
             preflight_timeline_path.unlink(missing_ok=True)
+        if preflight_transition_graph_path.exists():
+            preflight_transition_graph_path.unlink(missing_ok=True)
 
     summary = {
         "target_duration_seconds": target_duration_seconds,
         "scene_count": len(scene_segments),
         "resolution_variants": len(resolutions),
         "codec_variants": len(codecs),
+        "transition_enabled": settings.transition.enabled,
+        "transition_type": settings.transition.transition_type,
+        "transition_duration_seconds": settings.transition.duration_seconds,
+        "transition_curve": settings.transition.curve,
     }
     log_structured(logger, "preflight_passed", **summary)
     return summary
@@ -1251,13 +1258,14 @@ def run_render_preflight(
     work_dir: Path | None = None,
     seamless_crossfade_seconds: float = SEAMLESS_LOOP_CROSSFADE_SECONDS,
     scene_crossfade_seconds: float | None = None,
+    transition_config: TransitionConfig | dict[str, object] | None = None,
     logger: logging.Logger | None = None,
 ) -> dict[str, object]:
     if not ordered_video_paths:
         raise ValueError("No video clips provided.")
 
     _require_ffmpeg_tools()
-    settings = _build_render_settings(render_profile, scene_crossfade_seconds)
+    settings = _build_render_settings(render_profile, scene_crossfade_seconds, transition_config=transition_config)
     normalized_video_inputs = _normalize_ordered_video_inputs(ordered_video_paths)
 
     temporary_dir = work_dir or audio_mix_path.parent / "video_work"
@@ -1275,7 +1283,7 @@ def run_render_preflight(
     preflight = preflight_render_check(
         scene_segments=scenes,
         target_duration_seconds=target_duration_seconds,
-        scene_crossfade_seconds=settings.crossfade_seconds,
+        settings=settings,
         temporary_dir=temporary_dir,
         logger=logger,
     )
@@ -1297,6 +1305,7 @@ def render_final_video(
     work_dir: Path | None = None,
     seamless_crossfade_seconds: float = SEAMLESS_LOOP_CROSSFADE_SECONDS,
     scene_crossfade_seconds: float | None = None,
+    transition_config: TransitionConfig | dict[str, object] | None = None,
     on_progress: Callable[[float, float], None] | None = None,
     keep_intermediate_files: bool = False,
     logger: logging.Logger | None = None,
@@ -1305,7 +1314,7 @@ def render_final_video(
         raise ValueError("No video clips provided.")
 
     _require_ffmpeg_tools()
-    settings = _build_render_settings(render_profile, scene_crossfade_seconds)
+    settings = _build_render_settings(render_profile, scene_crossfade_seconds, transition_config=transition_config)
     normalized_video_inputs = _normalize_ordered_video_inputs(ordered_video_paths)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1332,21 +1341,13 @@ def render_final_video(
     preflight_render_check(
         scene_segments=scenes,
         target_duration_seconds=target_duration_seconds,
-        scene_crossfade_seconds=settings.crossfade_seconds,
+        settings=settings,
         temporary_dir=temporary_dir,
         logger=logger,
     )
 
     scene_timeline_path = (temporary_dir / SCENE_TIMELINE_FILENAME).resolve()
-    scene_concat_path = (temporary_dir / SCENE_CONCAT_FILENAME).resolve()
-    _build_scene_concat_video(
-        scene_segments=scenes,
-        timeline_file_path=scene_timeline_path,
-        concat_video_path=scene_concat_path,
-        logger=logger,
-    )
-
-    render_completed = False
+    _write_scene_timeline_file(scenes, scene_timeline_path)
 
     try:
         progress_state = RenderProgressState(
@@ -1364,47 +1365,9 @@ def render_final_video(
         if settings.mode == "performance":
             if not gpu_ready:
                 raise RuntimeError("Performance mode requires a CUDA/NVENC GPU, but no compatible GPU was detected.")
-            _render_gpu_composite(
-                scenes=scenes,
-                concat_video_path=scene_concat_path,
-                audio_mix_path=audio_mix_path,
-                output_path=output_path,
-                temporary_dir=temporary_dir,
-                target_duration_seconds=target_duration_seconds,
-                settings=settings,
-                progress_state=progress_state,
-                scene_crossfade_seconds=settings.crossfade_seconds,
-                on_progress=on_progress,
-                logger=logger,
-            )
-            render_completed = True
-            log_structured(logger, "video_render_complete", encoder="h264_nvenc", output_path=str(output_path.resolve()))
-            return output_path, "h264_nvenc"
 
         encoder = "h264_nvenc" if gpu_ready else DEFAULT_VIDEO_CODEC
-        if encoder == "h264_nvenc":
-            try:
-                _render_gpu_composite(
-                    scenes=scenes,
-                    concat_video_path=scene_concat_path,
-                    audio_mix_path=audio_mix_path,
-                    output_path=output_path,
-                    temporary_dir=temporary_dir,
-                    target_duration_seconds=target_duration_seconds,
-                    settings=settings,
-                    progress_state=progress_state,
-                    scene_crossfade_seconds=settings.crossfade_seconds,
-                    on_progress=on_progress,
-                    logger=logger,
-                )
-                render_completed = True
-                log_structured(logger, "video_render_complete", encoder=encoder, output_path=str(output_path.resolve()))
-                return output_path, encoder
-            except RuntimeError as exc:
-                print(f"GPU render failed in '{settings.mode}' mode. Falling back to CPU libx264: {exc}", file=sys.stderr)
-                log_structured(logger, "encoder_fallback", from_encoder="h264_nvenc", to_encoder=DEFAULT_VIDEO_CODEC)
-                encoder = DEFAULT_VIDEO_CODEC
-        else:
+        if encoder == DEFAULT_VIDEO_CODEC and settings.mode != "preview":
             print(f"GPU unavailable. Falling back to CPU libx264 for '{settings.mode}' mode.", file=sys.stderr)
 
         chunked_scenes = _chunk_list(scenes, CHUNK_SIZE)
@@ -1424,7 +1387,7 @@ def render_final_video(
                 if remaining_duration_seconds <= 0:
                     break
 
-                full_chunk_duration = _assembled_duration_seconds(chunk_scenes, settings.crossfade_seconds)
+                full_chunk_duration = _assembled_duration_seconds(chunk_scenes, settings.transition_overlap_seconds)
                 chunk_target_duration = min(full_chunk_duration, remaining_duration_seconds)
                 if chunk_target_duration <= 0:
                     continue
@@ -1446,16 +1409,16 @@ def render_final_video(
                     chunk_scenes=chunk_scenes,
                     chunk_index=chunk_index,
                     temporary_dir=temporary_dir,
-                    concat_video_path=scene_concat_path,
+                    timeline_file_path=scene_timeline_path,
                     encoder=encoder,
                     settings=settings,
                     chunk_target_duration=chunk_target_duration,
                     progress_state=progress_state,
                     progress_offset_seconds=processed_duration_seconds,
-                    scene_crossfade_seconds=settings.crossfade_seconds,
+                    transition=settings.transition,
                     on_progress=on_progress,
                     logger=logger,
-                    final_filter_filename=FINAL_FILTER_SCRIPT_FILENAME,
+                    final_filter_filename=TRANSITION_GRAPH_FILENAME,
                 )
                 chunk_paths.append(chunk_path)
                 remaining_duration_seconds -= chunk_target_duration
@@ -1479,7 +1442,6 @@ def render_final_video(
                 logger=logger,
             )
             cpu_render_completed = True
-            render_completed = True
             log_structured(logger, "video_render_complete", encoder=encoder, output_path=str(output_path.resolve()))
         finally:
             if chunk_concat_path.exists():
@@ -1509,5 +1471,3 @@ def render_final_video(
     finally:
         if scene_timeline_path.exists():
             scene_timeline_path.unlink(missing_ok=True)
-        if render_completed and not keep_intermediate_files and scene_concat_path.exists():
-            scene_concat_path.unlink(missing_ok=True)

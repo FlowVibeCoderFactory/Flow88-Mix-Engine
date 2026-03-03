@@ -17,5 +17,4 @@ input/
 # Editor/system files
 .DS_Store
 Thumbs.db
-logs/render_1772441759.log
-logs/render_1772441828.log
+logs/

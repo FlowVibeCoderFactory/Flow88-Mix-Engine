@@ -20,6 +20,10 @@ const openSourceVideoButton = document.getElementById("open-source-video-button"
 const openOutputAudioButton = document.getElementById("open-output-audio-button");
 const openOutputVideoButton = document.getElementById("open-output-video-button");
 const renderProfileSelect = document.getElementById("render-profile-select");
+const transitionTypeSelect = document.getElementById("transition-type-select");
+const transitionDurationRange = document.getElementById("transition-duration-range");
+const transitionDurationValue = document.getElementById("transition-duration-value");
+const transitionCurveSelect = document.getElementById("transition-curve-select");
 
 const sortBpmButton = document.getElementById("sort-bpm-button");
 const sortKeyButton = document.getElementById("sort-key-button");
@@ -39,6 +43,12 @@ const state = {
     videos: [],
     videoProfiles: {},
     selectedRenderProfile: "balanced",
+    videoTransition: {
+        enabled: true,
+        type: "fade",
+        duration: 1.0,
+        curve: "linear"
+    },
     videoJobId: null,
     videoJobPollHandle: null,
     nextVideoItemId: 1,
@@ -165,6 +175,21 @@ function renderProfileOptions() {
         state.selectedRenderProfile = profileNames.includes("balanced") ? "balanced" : profileNames[0];
     }
     renderProfileSelect.value = state.selectedRenderProfile;
+}
+
+function syncTransitionControls() {
+    if (transitionTypeSelect) {
+        transitionTypeSelect.value = state.videoTransition.type;
+    }
+    if (transitionCurveSelect) {
+        transitionCurveSelect.value = state.videoTransition.curve;
+    }
+    if (transitionDurationRange) {
+        transitionDurationRange.value = String(state.videoTransition.duration);
+    }
+    if (transitionDurationValue) {
+        transitionDurationValue.textContent = `${Number(state.videoTransition.duration).toFixed(1)}s`;
+    }
 }
 
 function setVideoProgress(percent) {
@@ -411,6 +436,15 @@ function buildVideoItemsPayload() {
     }));
 }
 
+function buildTransitionPayload() {
+    return {
+        enabled: Boolean(state.videoTransition.enabled),
+        type: String(state.videoTransition.type || "fade").toLowerCase(),
+        duration: Math.max(0.2, Math.min(3.0, Number(state.videoTransition.duration) || 1.0)),
+        curve: String(state.videoTransition.curve || "linear").toLowerCase()
+    };
+}
+
 async function readApiError(response, fallbackMessage) {
     const contentType = response.headers.get("content-type") || "";
     if (contentType.includes("application/json")) {
@@ -427,13 +461,14 @@ async function readApiError(response, fallbackMessage) {
     return fallbackMessage;
 }
 
-async function runRenderPreflight(items, renderProfile) {
+async function runRenderPreflight(items, renderProfile, transition) {
     const response = await fetch(`${apiBase}/render-preflight`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
             items,
-            render_profile: renderProfile
+            render_profile: renderProfile,
+            transition
         })
     });
 
@@ -526,7 +561,8 @@ async function generateVideo() {
 
     try {
         const items = buildVideoItemsPayload();
-        const preflight = await runRenderPreflight(items, state.selectedRenderProfile);
+        const transition = buildTransitionPayload();
+        const preflight = await runRenderPreflight(items, state.selectedRenderProfile, transition);
         setStatus(
             "video",
             `Preflight passed (${preflight.scene_count} scenes, ${Math.round(preflight.target_duration_seconds)}s). Queueing render...`
@@ -536,7 +572,8 @@ async function generateVideo() {
             "/generate-video",
             {
                 items,
-                render_profile: state.selectedRenderProfile
+                render_profile: state.selectedRenderProfile,
+                transition
             },
             "Render started"
         );
@@ -575,7 +612,8 @@ async function generatePreview() {
             "/generate-preview",
             {
                 items: buildVideoItemsPayload(),
-                render_profile: "preview"
+                render_profile: "preview",
+                transition: buildTransitionPayload()
             },
             "Preview started"
         );
@@ -801,6 +839,19 @@ sortVideoAzButton.addEventListener("click", sortVideosByTitle);
 renderProfileSelect?.addEventListener("change", () => {
     state.selectedRenderProfile = renderProfileSelect.value;
 });
+transitionTypeSelect?.addEventListener("change", () => {
+    state.videoTransition.type = String(transitionTypeSelect.value || "fade").toLowerCase();
+    syncTransitionControls();
+});
+transitionCurveSelect?.addEventListener("change", () => {
+    state.videoTransition.curve = String(transitionCurveSelect.value || "linear").toLowerCase();
+    syncTransitionControls();
+});
+transitionDurationRange?.addEventListener("input", () => {
+    const parsed = Math.max(0.2, Math.min(3.0, Number(transitionDurationRange.value) || 1.0));
+    state.videoTransition.duration = Math.round(parsed * 10) / 10;
+    syncTransitionControls();
+});
 
 window.addEventListener("load", () => {
     updateSortButtonLabel(sortBpmButton, "Sort BPM", state.sortDirection.bpm);
@@ -808,6 +859,7 @@ window.addEventListener("load", () => {
     updateSortButtonLabel(sortAzButton, "Sort A-Z", state.sortDirection.title);
     updateSortButtonLabel(sortVideoAzButton, "Sort A-Z", state.sortDirection.videoTitle);
     renderProfileOptions();
+    syncTransitionControls();
     setVideoProgress(0);
     setVideoEta(null);
     setActiveTab("audio");

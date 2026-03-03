@@ -1,123 +1,144 @@
-﻿# LLM Context: Flow88 Mix Engine
+# LLM Context: Flow88 Mix Engine
 
 ## Project Goal
 
-Flow88 Mix Engine creates a single continuous DJ-style mix from local tracks. It prioritizes fast local workflow:
+Flow88 Mix Engine is a local-first audio and video mastering tool.
 
-- Analyze files from `input/`
-- Let user reorder/sort in UI
-- Render final WAV + tracklist into `output/`
+- Analyze local audio from `input/` and produce a DJ-style mixed WAV.
+- Build a video timeline from clips in `input/videos/`.
+- Render final video with configurable clip transitions.
+- Write outputs to `output/`.
 
 ## Main Execution Paths
 
 ### 1) API + Frontend (primary UX)
 
 - Entrypoint: `server.py`
-- UI served from `frontend/`
-- User actions:
-- Load tracks (`GET /tracks`)
-- Reorder/sort in browser
-- Render (`POST /mix`)
+- UI: `frontend/index.html`, `frontend/app.js`, `frontend/styles.css`
+- Audio flow:
+- `GET /tracks` -> queue/sort -> `POST /mix`
+- Video flow:
+- `GET /videos` -> queue/reorder/loop -> `POST /render-preflight` -> `POST /generate-video` or `POST /generate-preview`
+- Video job polling:
+- `GET /video-jobs/{job_id}`
 
 ### 2) Desktop Wrapper
 
 - Entrypoint: `desktop_app.py`
-- Runs uvicorn in a background thread
+- Starts uvicorn in a background thread
 - Opens embedded webview at `http://127.0.0.1:8000`
 
-### 3) CLI Pipeline
+### 3) CLI Audio Pipeline
 
 - Entrypoint: `main.py`
-- Runs analyze -> timeline -> render -> tracklist directly without frontend
+- Runs analyze -> timeline -> render -> tracklist without frontend
 
 ## Code Map
 
 - `analyzer.py`
-- File discovery and metadata extraction via `mutagen`
-- BPM/key analysis via `librosa`
-- Camelot key mapping
+- Audio file discovery and metadata extraction
+- BPM/key analysis and harmonic key mapping
 - `mixer.py`
-- Transition duration calculation
-- Timeline calculation (`build_timeline`)
-- FFmpeg filter graph generation (`_build_filtergraph`)
-- Mix render (`render_mix`) with final loudness normalization
-- `tracklist.py`
-- Timestamp formatting
-- Tracklist file generation
-- `models.py`
-- `TrackAnalysis` and `TimelineEntry` dataclasses
+- Audio timeline and FFmpeg `acrossfade` + `loudnorm` graph
+- `video_processor.py`
+- Scene expansion, transition graph generation, preflight checks, chunk render, final mux
 - `server.py`
-- FastAPI routes and request/response DTOs
-- Ordered track validation before rendering
+- FastAPI routes, DTO validation, video job lifecycle
 - `frontend/app.js`
-- Client state and drag/drop ordering
-- Sorting by BPM/key/title
-- API calls and status messaging
+- Queue state, drag/drop, transition controls, API calls
+- `tracklist.py`
+- Tracklist timestamp formatting and write
+- `models.py`
+- `TrackAnalysis`, `TimelineEntry`, `VideoAnalysis`
 
 ## Data Contracts
 
-### `TrackAnalysis`
-
-Core analysis payload used across backend.
-
-Fields:
-
-- `file_path: Path`
-- `title: str`
-- `artist: str`
-- `bpm: float | None`
-- `duration_seconds: float`
-- `trim_start_seconds: float`
-- `trim_end_seconds: float`
-- `musical_key: str | None`
-- `harmonic_key: str | None`
-
-Derived property:
-
-- `trimmed_duration_seconds`
-
-### API DTOs (in `server.py`)
+### Audio DTOs
 
 - `TrackDTO`
 - `TrackListResponse`
-- `MixRequest` (`tracks: list[str]` of file names)
+- `MixRequest`
 - `MixResponse`
+
+### Video DTOs (`server.py`)
+
+- `VideoItemDTO`
+- `TransitionConfigDTO`
+- `GenerateVideoRequest`
+- `RenderPreflightResponse`
+- `GenerateVideoJobResponse`
+- `JobProgressResponse`
+
+`GenerateVideoRequest.transition` fields:
+
+- `enabled: bool`
+- `type: str`
+- `duration: float` (`0.2` to `3.0`)
+- `curve: "linear" | "easein" | "easeout"`
 
 ## Rendering Behavior
 
-- Crossfade default: `15.0` seconds (`DEFAULT_CROSSFADE_SECONDS`)
-- Transition duration is capped by both adjacent trimmed durations
-- FFmpeg graph chain: trimmed track streams -> `acrossfade` chain -> `loudnorm`
-- Output format: WAV (`pcm_s24le`)
+### Audio
 
-## External Dependencies and Runtime Assumptions
+- Default audio crossfade: `15.0s` (`DEFAULT_CROSSFADE_SECONDS`)
+- Render chain: trimmed track streams -> `acrossfade` chain -> `loudnorm`
+- Output codec: `pcm_s24le`
 
-- `ffmpeg` must be present in system `PATH`
-- Python packages from `requirements.txt`
-- Input tracks are loaded from repo-local `input/`
-- Output files written to repo-local `output/`
-- `/open-output` route is Windows-specific (`os.startfile`)
+### Video
+
+- Default transition:
+- `enabled=true`
+- `type=fade`
+- `duration=1.0`
+- `curve=linear`
+- Preview mode applies a 50% duration reduction to transition duration.
+- Filter graph generation is dynamic:
+- `split -> trim -> setpts -> (fps/scale/pad/format) -> xfade chain`
+- Xfade offsets use:
+- `offset_i = sum(previous clip durations) - (transition_duration * i)`
+- If transitions are disabled, filter graph uses `concat=n=...:v=1:a=0`.
+- Render command pattern:
+- `ffmpeg -f concat -safe 0 -i timeline.txt -filter_complex_script transition_graph.txt -map [vout] ...`
+- CPU and NVENC paths render in chunks (`CHUNK_SIZE=6`) to bound memory use.
+
+## Preflight Behavior
+
+Video preflight validates:
+
+- Stream presence, duration sanity, codec/resolution consistency
+- Transition compatibility with scene durations
+- Assembled timeline length against target duration
+- Concat input dry-run
+- Transition graph dry-run (separate FFmpeg validation)
 
 ## Frontend Notes
 
-- `state.tracks` stores current order; drag/drop mutates this array
-- Sort buttons toggle ascending/descending by flipping `sortDirection` sign
-- Harmonic key sort parses keys with `/^(\d+)([AB])$/i`
-- Rendering request sends only ordered file names; backend re-resolves full track data
+- Video Master controls include:
+- Transition type dropdown
+- Transition duration slider (`0.2s` to `3.0s`)
+- Transition curve selector (`linear`, `easein`, `easeout`)
+- Transition payload is sent for preflight, master render, and preview render.
+
+## External Dependencies and Runtime Assumptions
+
+- `ffmpeg` and `ffprobe` in `PATH`
+- Python packages from `requirements.txt`
+- Input paths: `input/`, `input/videos/`
+- Output path: `output/`
+- `open-*` folder routes are Windows-specific (`os.startfile`)
 
 ## Known Gaps / Risks
 
 - No automated tests currently
-- Heavy audio analysis/rendering runs synchronously in API request lifecycle
-- Large input libraries can increase render latency
-- Minimal error classification from FFmpeg subprocess failures
+- FFmpeg transition names are syntax-validated in API but can still fail if unsupported by local FFmpeg build
+- Large media sets can still create long render times
 
 ## Recommended Change Workflow for LLMs
 
-1. Keep `TrackAnalysis` contract stable unless updating all dependent modules.
-2. If adjusting mix logic, update both timeline and FFmpeg graph behavior coherently.
-3. Preserve API response shapes expected by `frontend/app.js`.
-4. Avoid committing generated media, caches, or local artifacts.
+1. Keep frontend payload shape and backend DTOs synchronized.
+2. When changing transitions, update both graph generation and preflight validation.
+3. Preserve concat timeline + single input stream assumptions for memory safety.
+4. Avoid committing generated media/caches.
 
 ## Useful Commands
 
@@ -139,7 +160,7 @@ Run desktop app:
 python desktop_app.py
 ```
 
-Run CLI pipeline:
+Run CLI audio pipeline:
 
 ```bash
 python main.py

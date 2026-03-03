@@ -27,6 +27,10 @@ from render_logging import close_render_logger, create_render_logger, log_struct
 from tracklist import write_tracklist
 from video_processor import (
     DEFAULT_RENDER_PROFILE,
+    DEFAULT_TRANSITION_CURVE,
+    DEFAULT_TRANSITION_DURATION_SECONDS,
+    DEFAULT_TRANSITION_ENABLED,
+    DEFAULT_TRANSITION_TYPE,
     PREVIEW_OUTPUT_FILENAME,
     RENDER_PROFILES,
     analyze_video_directory,
@@ -80,9 +84,17 @@ class VideoItemDTO(BaseModel):
     loop_count: int = Field(1, ge=1)
 
 
+class TransitionConfigDTO(BaseModel):
+    enabled: bool = Field(DEFAULT_TRANSITION_ENABLED)
+    type: str = Field(DEFAULT_TRANSITION_TYPE)
+    duration: float = Field(DEFAULT_TRANSITION_DURATION_SECONDS, ge=0.2, le=3.0)
+    curve: str = Field(DEFAULT_TRANSITION_CURVE)
+
+
 class GenerateVideoRequest(BaseModel):
     items: list[VideoItemDTO] | None = None
     render_profile: str = Field(DEFAULT_RENDER_PROFILE)
+    transition: TransitionConfigDTO | None = None
     videos: list[str] | None = None
     loop_counts: dict[str, int] = Field(default_factory=dict)
 
@@ -100,6 +112,10 @@ class RenderPreflightResponse(BaseModel):
     scene_count: int
     resolution_variants: int
     codec_variants: int
+    transition_enabled: bool
+    transition_type: str
+    transition_duration_seconds: float
+    transition_curve: str
     log_path: str
 
 
@@ -257,6 +273,26 @@ def _normalize_render_profile(profile_name: str) -> str:
     return normalized
 
 
+def _normalize_transition_request(transition: TransitionConfigDTO | None) -> dict[str, object]:
+    source = transition or TransitionConfigDTO()
+    transition_type = source.type.strip().lower() or DEFAULT_TRANSITION_TYPE
+    if not transition_type or any((not char.isalnum()) and char != "_" for char in transition_type):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported transition type '{source.type}'. Use letters, numbers, and underscores only.",
+        )
+    curve = source.curve.strip().lower() or DEFAULT_TRANSITION_CURVE
+    if curve not in {"linear", "easein", "easeout"}:
+        raise HTTPException(status_code=400, detail=f"Unsupported transition curve '{source.curve}'.")
+
+    return {
+        "enabled": bool(source.enabled),
+        "type": transition_type,
+        "duration": float(source.duration),
+        "curve": curve,
+    }
+
+
 def _update_job_progress(job_id: str, **updates: Any) -> None:
     with JOB_PROGRESS_LOCK:
         progress = JOB_PROGRESS.get(job_id)
@@ -280,6 +316,7 @@ def _run_video_render_job(
     ordered_video_paths: list[tuple[Path, int]],
     output_video_path: Path,
     render_profile: str,
+    transition_config: dict[str, object],
 ) -> None:
     logger, log_path = create_render_logger()
     resolved_log_path = str(log_path.resolve())
@@ -319,6 +356,7 @@ def _run_video_render_job(
                 ordered_video_paths=ordered_video_paths,
                 output_path=output_video_path,
                 render_profile=render_profile,
+                transition_config=transition_config,
                 on_progress=on_progress,
                 logger=logger,
             )
@@ -416,6 +454,7 @@ def post_mix(request: MixRequest) -> MixResponse:
 def post_render_preflight(request: GenerateVideoRequest) -> RenderPreflightResponse:
     requested_items = _normalize_video_items_request(request)
     render_profile = _normalize_render_profile(request.render_profile)
+    transition_config = _normalize_transition_request(request.transition)
 
     if render_profile == "performance":
         try:
@@ -445,6 +484,7 @@ def post_render_preflight(request: GenerateVideoRequest) -> RenderPreflightRespo
             audio_mix_path=audio_input_path,
             ordered_video_paths=ordered_video_paths,
             render_profile=render_profile,
+            transition_config=transition_config,
             logger=logger,
         )
     except Exception as exc:
@@ -462,6 +502,10 @@ def post_render_preflight(request: GenerateVideoRequest) -> RenderPreflightRespo
         scene_count=int(preflight["scene_count"]),
         resolution_variants=int(preflight["resolution_variants"]),
         codec_variants=int(preflight["codec_variants"]),
+        transition_enabled=bool(preflight["transition_enabled"]),
+        transition_type=str(preflight["transition_type"]),
+        transition_duration_seconds=float(preflight["transition_duration_seconds"]),
+        transition_curve=str(preflight["transition_curve"]),
         log_path=resolved_log_path,
     )
 
@@ -470,6 +514,7 @@ def post_render_preflight(request: GenerateVideoRequest) -> RenderPreflightRespo
 def post_generate_video(request: GenerateVideoRequest) -> GenerateVideoJobResponse:
     requested_items = _normalize_video_items_request(request)
     render_profile = _normalize_render_profile(request.render_profile)
+    transition_config = _normalize_transition_request(request.transition)
 
     if render_profile == "performance":
         try:
@@ -508,7 +553,7 @@ def post_generate_video(request: GenerateVideoRequest) -> GenerateVideoJobRespon
 
     worker = threading.Thread(
         target=_run_video_render_job,
-        args=(job_id, audio_input_path, ordered_video_paths, output_video_path, render_profile),
+        args=(job_id, audio_input_path, ordered_video_paths, output_video_path, render_profile, transition_config),
         daemon=True,
     )
     worker.start()
@@ -519,6 +564,7 @@ def post_generate_video(request: GenerateVideoRequest) -> GenerateVideoJobRespon
 @app.post("/generate-preview", response_model=GenerateVideoJobResponse)
 def post_generate_preview(request: GenerateVideoRequest) -> GenerateVideoJobResponse:
     requested_items = _normalize_video_items_request(request)
+    transition_config = _normalize_transition_request(request.transition)
     all_videos = _load_videos()
     ordered_video_paths = _resolve_video_items(all_videos, requested_items)
 
@@ -545,7 +591,7 @@ def post_generate_preview(request: GenerateVideoRequest) -> GenerateVideoJobResp
 
     worker = threading.Thread(
         target=_run_video_render_job,
-        args=(job_id, audio_input_path, ordered_video_paths, output_video_path, "preview"),
+        args=(job_id, audio_input_path, ordered_video_paths, output_video_path, "preview", transition_config),
         daemon=True,
     )
     worker.start()

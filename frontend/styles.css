@@ -287,6 +287,29 @@ h1 {
     font-weight: 600;
 }
 
+.transition-duration-wrap {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.42rem;
+    height: 32px;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    padding: 0 0.55rem 0 0.75rem;
+    background: #2a2a2c;
+    color: var(--text);
+    font-size: 0.72rem;
+    font-weight: 600;
+}
+
+.transition-duration-range {
+    width: 112px;
+    accent-color: var(--accent);
+}
+
+.transition-duration-wrap strong {
+    font-weight: 700;
+}
+
 .status {
     margin: 0;
     min-width: 100%;
@@ -499,5 +522,9 @@ h1 {
     .video-meta-stack {
         justify-content: flex-start;
         flex-wrap: wrap;
+    }
+
+    .transition-duration-range {
+        width: 92px;
     }
 }

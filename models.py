@@ -15,6 +15,17 @@ class TrackAnalysis:
     trim_end_seconds: float
     musical_key: str | None = None
     harmonic_key: str | None = None
+    duration: float | None = None
+
+    def __post_init__(self) -> None:
+        normalized_duration = self.duration if self.duration is not None else self.duration_seconds
+        try:
+            parsed_duration = float(normalized_duration)
+        except (TypeError, ValueError):
+            parsed_duration = 0.0
+        normalized_duration = max(0.0, parsed_duration)
+        self.duration = normalized_duration
+        self.duration_seconds = normalized_duration
 
     @property
     def trimmed_duration_seconds(self) -> float:

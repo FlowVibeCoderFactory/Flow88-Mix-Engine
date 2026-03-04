@@ -37,8 +37,10 @@ Flow88 Mix Engine is a local-first audio and video mastering tool.
 
 - `analyzer.py`
 - Audio file discovery and metadata extraction
+- Audio duration probing via `ffprobe`
 - BPM/key analysis and harmonic key mapping
 - `mixer.py`
+- Audio timeline helpers (`compute_start_times`, `compute_mix_length`)
 - Audio timeline and FFmpeg `acrossfade` + `loudnorm` graph
 - `video_processor.py`
 - Scene expansion, transition graph generation, preflight checks, chunk render, final mux
@@ -46,6 +48,7 @@ Flow88 Mix Engine is a local-first audio and video mastering tool.
 - FastAPI routes, DTO validation, video job lifecycle
 - `frontend/app.js`
 - Queue state, drag/drop, transition controls, API calls
+- Audio table start/duration (`mm:ss`) and total mix length footer rendering
 - `tracklist.py`
 - Tracklist timestamp formatting and write
 - `models.py`
@@ -55,10 +58,15 @@ Flow88 Mix Engine is a local-first audio and video mastering tool.
 
 ### Audio DTOs
 
-- `TrackDTO`
+- `TrackDTO` (`duration`, `duration_seconds`, trim bounds, bpm/key metadata)
 - `TrackListResponse`
 - `MixRequest`
 - `MixResponse`
+
+`TrackAnalysis` now includes both:
+
+- `duration` (canonical duration value)
+- `duration_seconds` (kept in sync for backwards compatibility)
 
 ### Video DTOs (`server.py`)
 
@@ -81,6 +89,10 @@ Flow88 Mix Engine is a local-first audio and video mastering tool.
 ### Audio
 
 - Default audio crossfade: `15.0s` (`DEFAULT_CROSSFADE_SECONDS`)
+- Timeline starts are computed from trimmed durations minus per-edge overlap:
+- `start[i+1] = start[i] + max(0, trimmed[i] - min(crossfade, trimmed[i], trimmed[i+1]))`
+- Mix length is:
+- `last_start + last_trimmed_duration`
 - Render chain: trimmed track streams -> `acrossfade` chain -> `loudnorm`
 - Output codec: `pcm_s24le`
 
@@ -113,6 +125,10 @@ Video preflight validates:
 
 ## Frontend Notes
 
+- Audio tab shows:
+- Per-track `Start` and `Duration` columns
+- `Total Mix Length` footer
+- All audio timeline timestamps are formatted as `mm:ss`
 - Video Master controls include:
 - Transition type dropdown
 - Transition duration slider (`0.2s` to `3.0s`)

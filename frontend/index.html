@@ -61,8 +61,23 @@
 
             <section class="table-shell" aria-label="Track list">
                 <table class="track-table" role="grid">
+                    <thead>
+                        <tr class="table-header-row">
+                            <th class="col-grip" scope="col" aria-label="Queue handle"></th>
+                            <th class="col-title" scope="col">Title</th>
+                            <th class="col-artist" scope="col">Artist</th>
+                            <th class="col-key" scope="col">Key</th>
+                            <th class="col-bpm" scope="col">BPM</th>
+                            <th class="col-start" scope="col">Start</th>
+                            <th class="col-duration" scope="col">Duration</th>
+                        </tr>
+                    </thead>
                     <tbody id="track-list-body" aria-live="polite"></tbody>
                 </table>
+                <div class="table-footer">
+                    <span>Total Mix Length</span>
+                    <strong id="audio-total-duration">--:--</strong>
+                </div>
             </section>
         </section>
 

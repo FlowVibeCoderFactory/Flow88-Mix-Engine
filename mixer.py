@@ -28,23 +28,43 @@ def compute_transition_durations(track_data: list[TrackAnalysis], crossfade_seco
     return transition_durations
 
 
+def compute_start_times(
+    tracks: list[TrackAnalysis], crossfade: float = DEFAULT_CROSSFADE_SECONDS
+) -> list[float]:
+    if not tracks:
+        return []
+
+    transition_durations = compute_transition_durations(tracks, crossfade)
+    start_times = [0.0]
+    absolute_start_seconds = 0.0
+
+    for index, track in enumerate(tracks[:-1]):
+        overlap = max(0.0, transition_durations[index])
+        absolute_start_seconds += max(0.0, track.trimmed_duration_seconds - overlap)
+        start_times.append(max(0.0, absolute_start_seconds))
+
+    return start_times
+
+
+def compute_mix_length(
+    tracks: list[TrackAnalysis], crossfade: float = DEFAULT_CROSSFADE_SECONDS
+) -> float:
+    if not tracks:
+        return 0.0
+
+    start_times = compute_start_times(tracks, crossfade)
+    last_track_duration = max(0.0, tracks[-1].trimmed_duration_seconds)
+    return max(0.0, start_times[-1] + last_track_duration)
+
+
 def build_timeline(
     track_data: list[TrackAnalysis], crossfade_seconds: float = DEFAULT_CROSSFADE_SECONDS
 ) -> list[TimelineEntry]:
-    if not track_data:
-        return []
-
-    transition_durations = compute_transition_durations(track_data, crossfade_seconds)
-    timeline: list[TimelineEntry] = []
-    absolute_start_seconds = 0.0
-
-    for index, track in enumerate(track_data):
-        timeline.append(TimelineEntry(absolute_start_seconds=max(0.0, absolute_start_seconds), track=track))
-        if index < len(track_data) - 1:
-            overlap = max(0.0, transition_durations[index])
-            absolute_start_seconds += max(0.0, track.trimmed_duration_seconds - overlap)
-
-    return timeline
+    start_times = compute_start_times(track_data, crossfade_seconds)
+    return [
+        TimelineEntry(absolute_start_seconds=max(0.0, start_times[index]), track=track)
+        for index, track in enumerate(track_data)
+    ]
 
 
 # -----------------------------

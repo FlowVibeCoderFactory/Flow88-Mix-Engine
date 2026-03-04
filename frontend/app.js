@@ -1,6 +1,7 @@
 const apiBase = window.location.origin.startsWith("http")
     ? window.location.origin
     : "http://localhost:8000";
+const AUDIO_CROSSFADE_SECONDS = 15.0;
 
 const audioTabButton = document.getElementById("audio-tab-button");
 const videoTabButton = document.getElementById("video-tab-button");
@@ -36,6 +37,7 @@ const videoEtaElement = document.getElementById("video-eta");
 const audioProgressElement = document.getElementById("audio-progress");
 const videoProgressElement = document.getElementById("video-progress");
 const videoProgressBarElement = document.getElementById("video-progress-bar");
+const audioTotalDurationElement = document.getElementById("audio-total-duration");
 
 const state = {
     activeTab: "audio",
@@ -91,15 +93,73 @@ function formatBpm(bpm) {
 }
 
 function formatDuration(seconds) {
-    const numeric = Number(seconds);
-    if (!Number.isFinite(numeric) || numeric <= 0) {
+    if (seconds === null || seconds === undefined) {
         return "--:--";
     }
 
-    const totalSeconds = Math.floor(numeric);
-    const minutes = Math.floor(totalSeconds / 60);
+    const numeric = Number(seconds);
+    if (!Number.isFinite(numeric) || numeric < 0) {
+        return "--:--";
+    }
+
+    const totalSeconds = Math.floor(Math.max(0, numeric));
+    const minutes = String(Math.floor(totalSeconds / 60)).padStart(2, "0");
     const remainder = String(totalSeconds % 60).padStart(2, "0");
     return `${minutes}:${remainder}`;
+}
+
+function readTrackDurationSeconds(track) {
+    const rawDuration = track?.duration ?? track?.duration_seconds;
+    const duration = Number(rawDuration);
+    if (!Number.isFinite(duration) || duration < 0) {
+        return 0;
+    }
+    return duration;
+}
+
+function readTrackTrimmedDurationSeconds(track) {
+    const trimStart = Number(track?.trim_start_seconds);
+    const trimEnd = Number(track?.trim_end_seconds);
+    if (Number.isFinite(trimStart) && Number.isFinite(trimEnd)) {
+        return Math.max(0, trimEnd - trimStart);
+    }
+    return readTrackDurationSeconds(track);
+}
+
+function computeAudioStartTimes(tracks, crossfadeSeconds = AUDIO_CROSSFADE_SECONDS) {
+    if (!Array.isArray(tracks) || tracks.length === 0) {
+        return [];
+    }
+
+    const startTimes = [0];
+    let absoluteStart = 0;
+
+    for (let index = 0; index < tracks.length - 1; index += 1) {
+        const currentDuration = readTrackTrimmedDurationSeconds(tracks[index]);
+        const nextDuration = readTrackTrimmedDurationSeconds(tracks[index + 1]);
+        const overlap = Math.max(0, Math.min(crossfadeSeconds, currentDuration, nextDuration));
+        absoluteStart += Math.max(0, currentDuration - overlap);
+        startTimes.push(Math.max(0, absoluteStart));
+    }
+
+    return startTimes;
+}
+
+function computeAudioMixLength(tracks, crossfadeSeconds = AUDIO_CROSSFADE_SECONDS) {
+    if (!Array.isArray(tracks) || tracks.length === 0) {
+        return null;
+    }
+
+    const startTimes = computeAudioStartTimes(tracks, crossfadeSeconds);
+    const lastTrackDuration = readTrackTrimmedDurationSeconds(tracks[tracks.length - 1]);
+    return Math.max(0, startTimes[startTimes.length - 1] + lastTrackDuration);
+}
+
+function setAudioTotalDuration(seconds) {
+    if (!audioTotalDurationElement) {
+        return;
+    }
+    audioTotalDurationElement.textContent = formatDuration(seconds);
 }
 
 function formatFrameRate(value) {
@@ -260,9 +320,13 @@ function renderTracks() {
     trackListBody.innerHTML = "";
 
     if (state.tracks.length === 0) {
+        setAudioTotalDuration(null);
         setStatus("audio", "No tracks found in /input.", "error");
         return;
     }
+
+    const startTimes = computeAudioStartTimes(state.tracks, AUDIO_CROSSFADE_SECONDS);
+    const totalMixDurationSeconds = computeAudioMixLength(state.tracks, AUDIO_CROSSFADE_SECONDS);
 
     state.tracks.forEach((track, index) => {
         const row = document.createElement("tr");
@@ -275,6 +339,8 @@ function renderTracks() {
             <td class="col-artist">${escapeHtml(track.artist)}</td>
             <td class="col-key"><span class="badge key">${escapeHtml(track.harmonic_key ?? "--")}</span></td>
             <td class="col-bpm"><span class="badge">${formatBpm(track.bpm)} BPM</span></td>
+            <td class="col-start"><span class="badge">${formatDuration(startTimes[index])}</span></td>
+            <td class="col-duration"><span class="badge">${formatDuration(readTrackDurationSeconds(track))}</span></td>
         `;
 
         attachDragHandlers(row, (fromIndex, toIndex) => {
@@ -285,6 +351,8 @@ function renderTracks() {
 
         trackListBody.appendChild(row);
     });
+
+    setAudioTotalDuration(totalMixDurationSeconds);
 
     setStatus("audio", `Loaded ${state.tracks.length} tracks. Drag, sort, then render.`);
 }

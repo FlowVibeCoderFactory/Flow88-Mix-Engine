@@ -123,6 +123,19 @@ h1 {
     border-collapse: collapse;
 }
 
+.track-table thead th {
+    height: 28px;
+    padding: 0 0.42rem;
+    border-bottom: 1px solid #2c2c2f;
+    color: #b3b3b8;
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+    white-space: nowrap;
+    text-align: left;
+}
+
 #track-list-body {
     display: table-row-group;
 }
@@ -184,6 +197,12 @@ h1 {
     text-align: right;
 }
 
+.col-start,
+.col-duration {
+    width: 78px;
+    text-align: right;
+}
+
 .badge {
     display: inline-flex;
     align-items: center;
@@ -202,6 +221,23 @@ h1 {
     border-color: var(--badge-key-line);
     background: var(--badge-key-bg);
     color: #cad8ff;
+}
+
+.table-footer {
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.38rem 0.52rem 0.44rem;
+    border-top: 1px solid #2c2c2f;
+    color: #b3b3b8;
+    font-size: 0.72rem;
+}
+
+.table-footer strong {
+    color: var(--text);
+    font-size: 0.76rem;
+    letter-spacing: 0.02em;
 }
 
 .action-row {
@@ -511,7 +547,9 @@ h1 {
     }
 
     .col-key,
-    .col-bpm {
+    .col-bpm,
+    .col-start,
+    .col-duration {
         width: 62px;
     }
 

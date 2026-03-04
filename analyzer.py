@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 import math
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -86,16 +89,70 @@ def _extract_title_artist(file_path: Path) -> tuple[str, str]:
     return title, artist
 
 
+def _parse_positive_float(value: object) -> float | None:
+    if value is None:
+        return None
+
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+
+    if not math.isfinite(parsed) or parsed <= 0.0:
+        return None
+    return parsed
+
+
+def _probe_duration_seconds(file_path: Path) -> float:
+    if shutil.which("ffprobe") is None:
+        raise RuntimeError("ffprobe not found in PATH.")
+
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_streams",
+        "-show_format",
+        "-print_format",
+        "json",
+        str(file_path),
+    ]
+
+    try:
+        completed = subprocess.run(command, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr.strip() if exc.stderr else "Unknown ffprobe error."
+        raise RuntimeError(f"Failed to probe duration for '{file_path.name}': {stderr}") from exc
+
+    try:
+        media = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Failed to parse ffprobe output for '{file_path.name}'.") from exc
+
+    format_duration = _parse_positive_float(media.get("format", {}).get("duration"))
+    if format_duration is not None:
+        return format_duration
+
+    for stream in media.get("streams", []):
+        candidate = _parse_positive_float(stream.get("duration"))
+        if candidate is not None:
+            return candidate
+
+    raise ValueError(f"Could not determine duration for audio file: {file_path.name}")
+
+
 def _analyze_waveform(
     file_path: Path,
     silence_top_db: float,
-) -> tuple[float | None, float, float, float, str | None, str | None]:
+    duration_seconds: float,
+) -> tuple[float | None, float, float, str | None, str | None]:
     waveform, sample_rate = librosa.load(file_path, sr=None, mono=True)
 
     if sample_rate <= 0:
         raise ValueError(f"Invalid sample rate for {file_path.name}: {sample_rate}")
 
-    duration_seconds = float(len(waveform) / sample_rate)
+    waveform_duration_seconds = float(len(waveform) / sample_rate)
+    effective_duration_seconds = max(0.0, min(duration_seconds, waveform_duration_seconds))
 
     tempo, _ = librosa.beat.beat_track(y=waveform, sr=sample_rate)
     bpm = float(tempo) if tempo is not None and not math.isnan(float(tempo)) else None
@@ -103,19 +160,19 @@ def _analyze_waveform(
     non_silent = librosa.effects.split(waveform, top_db=silence_top_db)
     if len(non_silent) == 0:
         trim_start_seconds = 0.0
-        trim_end_seconds = duration_seconds
+        trim_end_seconds = effective_duration_seconds
         key_waveform = waveform
     else:
         trim_start_seconds = float(non_silent[0][0] / sample_rate)
         trim_end_seconds = float(non_silent[-1][1] / sample_rate)
         key_waveform = waveform[non_silent[0][0] : non_silent[-1][1]]
 
-    trim_start_seconds = max(0.0, min(trim_start_seconds, duration_seconds))
-    trim_end_seconds = max(trim_start_seconds, min(trim_end_seconds, duration_seconds))
+    trim_start_seconds = max(0.0, min(trim_start_seconds, effective_duration_seconds))
+    trim_end_seconds = max(trim_start_seconds, min(trim_end_seconds, effective_duration_seconds))
 
     musical_key, harmonic_key = _detect_harmonic_key(key_waveform, sample_rate)
 
-    return bpm, duration_seconds, trim_start_seconds, trim_end_seconds, musical_key, harmonic_key
+    return bpm, trim_start_seconds, trim_end_seconds, musical_key, harmonic_key
 
 
 def _normalize_vector(values: np.ndarray) -> np.ndarray:
@@ -169,9 +226,11 @@ def _detect_harmonic_key(waveform: np.ndarray, sample_rate: int) -> tuple[str | 
 
 def analyze_file(file_path: Path, silence_top_db: float = 60.0) -> TrackAnalysis:
     title, artist = _extract_title_artist(file_path)
-    bpm, duration_seconds, trim_start_seconds, trim_end_seconds, musical_key, harmonic_key = _analyze_waveform(
+    duration_seconds = _probe_duration_seconds(file_path)
+    bpm, trim_start_seconds, trim_end_seconds, musical_key, harmonic_key = _analyze_waveform(
         file_path=file_path,
         silence_top_db=silence_top_db,
+        duration_seconds=duration_seconds,
     )
 
     return TrackAnalysis(
@@ -179,6 +238,7 @@ def analyze_file(file_path: Path, silence_top_db: float = 60.0) -> TrackAnalysis
         title=title,
         artist=artist,
         bpm=bpm,
+        duration=duration_seconds,
         duration_seconds=duration_seconds,
         trim_start_seconds=trim_start_seconds,
         trim_end_seconds=trim_end_seconds,

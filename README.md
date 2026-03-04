@@ -18,8 +18,11 @@ Flow88 Mix Engine is a local-first Python app for audio mixing and video masteri
 ## Features
 
 - Analyze local audio in `input/` (`.mp3`, `.wav`, `.flac`, `.m4a`, `.aac`, `.ogg`)
+- Extract precise audio duration with `ffprobe`
 - Detect BPM, musical key, and Camelot harmonic key
 - Drag/drop sorting for audio and video queues
+- Audio table shows per-track `Start` and `Duration` in `mm:ss`
+- Audio footer shows total mix length in `mm:ss`
 - Audio mix rendering with FFmpeg `acrossfade` + `loudnorm`
 - Video rendering from `input/videos/` with configurable transitions
 - Transition controls:
@@ -94,11 +97,13 @@ runMixer.bat
 ## How Audio Rendering Works
 
 1. `analyzer.py` discovers files and extracts tags.
-2. `librosa` estimates BPM and key.
-3. `mixer.py` builds the audio filter graph.
-4. Tracks are chained with `acrossfade`.
-5. `loudnorm` is applied.
-6. Final WAV and tracklist are written to `output/`.
+2. `ffprobe` extracts source duration for each track.
+3. `librosa` estimates BPM and key.
+4. `mixer.py` computes timeline starts (`compute_start_times`) and total length (`compute_mix_length`).
+5. `mixer.py` builds the audio filter graph.
+6. Tracks are chained with `acrossfade`.
+7. `loudnorm` is applied.
+8. Final WAV and tracklist are written to `output/`.
 
 ## How Video Rendering Works
 
@@ -130,7 +135,7 @@ Preview mode transition duration is automatically reduced by 50%.
 ## API Endpoints
 
 - `GET /` serves `frontend/index.html`
-- `GET /tracks` returns analyzed tracks
+- `GET /tracks` returns analyzed tracks (includes `duration` and `duration_seconds`)
 - `POST /mix` renders the audio mix
 - `GET /videos` returns analyzed videos
 - `POST /render-preflight` validates video render inputs and transition graph

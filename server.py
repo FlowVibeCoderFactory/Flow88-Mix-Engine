@@ -4,6 +4,7 @@ import os
 import threading
 import uuid
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,15 @@ from mixer import DEFAULT_CROSSFADE_SECONDS, build_timeline, render_mix
 from models import TrackAnalysis, VideoAnalysis
 from render_logging import close_render_logger, create_render_logger, log_structured
 from tracklist import write_tracklist
+from project_persistence import (
+    autosave_project_path,
+    ensure_projects_dir,
+    list_projects,
+    load_project,
+    resolve_project_path,
+    save_project,
+    user_projects_dir,
+)
 from video_processor import (
     DEFAULT_RENDER_PROFILE,
     DEFAULT_TRANSITION_CURVE,
@@ -144,6 +154,61 @@ class JobProgressResponse(BaseModel):
 class VideoRenderProfilesResponse(BaseModel):
     default_profile: str
     profiles: dict[str, dict[str, Any]]
+
+
+class ProjectRenderSettingsDTO(BaseModel):
+    render_profile: str = Field(DEFAULT_RENDER_PROFILE)
+    interface_scale: float = Field(1.1, ge=0.9, le=1.5)
+
+
+class ProjectFileDTO(BaseModel):
+    format: str = Field("flowmix")
+    version: int = Field(1)
+    ordered_clips: list[str] = Field(default_factory=list)
+    loop_counts: list[int] = Field(default_factory=list)
+    transition: TransitionConfigDTO = Field(default_factory=TransitionConfigDTO)
+    audio_file: str = Field("")
+    render_settings: ProjectRenderSettingsDTO = Field(default_factory=ProjectRenderSettingsDTO)
+    saved_at: str | None = None
+
+
+class SaveProjectRequest(BaseModel):
+    path: str | None = None
+    project: ProjectFileDTO
+    autosave: bool = False
+
+
+class SaveProjectResponse(BaseModel):
+    path: str
+    file_name: str
+    autosave: bool
+    project_dir: str
+
+
+class LoadProjectRequest(BaseModel):
+    path: str
+
+
+class LoadProjectResponse(BaseModel):
+    path: str
+    project: ProjectFileDTO
+
+
+class ProjectListItemDTO(BaseModel):
+    file_name: str
+    path: str
+    modified_at: str
+
+
+class ProjectListResponse(BaseModel):
+    project_dir: str
+    projects: list[ProjectListItemDTO]
+
+
+class AutosaveStatusResponse(BaseModel):
+    exists: bool
+    path: str
+    project: ProjectFileDTO | None = None
 
 
 app = FastAPI(title="Flow88 Mix Engine API", version="0.1.0")
@@ -293,6 +358,65 @@ def _normalize_transition_request(transition: TransitionConfigDTO | None) -> dic
         "duration": float(source.duration),
         "curve": curve,
     }
+
+
+def _normalize_project_payload(project: ProjectFileDTO) -> dict[str, Any]:
+    ordered_clips = [str(file_name).strip() for file_name in project.ordered_clips]
+    if any(not file_name for file_name in ordered_clips):
+        raise HTTPException(status_code=400, detail="Project ordered_clips contains an empty file name.")
+
+    loop_counts = [int(loop_count) for loop_count in project.loop_counts]
+    if len(ordered_clips) != len(loop_counts):
+        raise HTTPException(status_code=400, detail="Project ordered_clips and loop_counts length mismatch.")
+    if any(loop_count <= 0 for loop_count in loop_counts):
+        raise HTTPException(status_code=400, detail="Project loop_counts must be positive integers.")
+
+    transition = _normalize_transition_request(project.transition)
+    render_profile = _normalize_render_profile(project.render_settings.render_profile)
+    interface_scale = float(project.render_settings.interface_scale)
+    if interface_scale < 0.9 or interface_scale > 1.5:
+        raise HTTPException(status_code=400, detail="Interface scale must be between 0.9 and 1.5.")
+
+    saved_at = datetime.now(timezone.utc).isoformat()
+    return {
+        "format": "flowmix",
+        "version": 1,
+        "ordered_clips": ordered_clips,
+        "loop_counts": loop_counts,
+        "transition": transition,
+        "audio_file": str(project.audio_file or "").strip(),
+        "render_settings": {
+            "render_profile": render_profile,
+            "interface_scale": interface_scale,
+        },
+        "saved_at": saved_at,
+    }
+
+
+def _load_project_payload(path: str | Path) -> tuple[Path, ProjectFileDTO]:
+    try:
+        resolved_path = resolve_project_path(path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        loaded_payload = load_project(resolved_path.name)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        project = ProjectFileDTO.model_validate(loaded_payload)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid .flowmix payload: {exc}") from exc
+
+    if len(project.ordered_clips) != len(project.loop_counts):
+        raise HTTPException(status_code=400, detail="Project ordered_clips and loop_counts length mismatch.")
+    if any(int(loop_count) <= 0 for loop_count in project.loop_counts):
+        raise HTTPException(status_code=400, detail="Project loop_counts must be positive integers.")
+
+    return resolved_path, project
 
 
 def _update_job_progress(job_id: str, **updates: Any) -> None:
@@ -629,6 +753,71 @@ def get_video_render_profiles() -> VideoRenderProfilesResponse:
         }
 
     return VideoRenderProfilesResponse(default_profile=DEFAULT_RENDER_PROFILE, profiles=profiles)
+
+
+@app.get("/projects", response_model=ProjectListResponse)
+def get_projects() -> ProjectListResponse:
+    projects_dir = ensure_projects_dir().resolve()
+    project_items: list[ProjectListItemDTO] = []
+    for path in list_projects():
+        stat = path.stat()
+        project_items.append(
+            ProjectListItemDTO(
+                file_name=path.name,
+                path=str(path.resolve()),
+                modified_at=datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+            )
+        )
+
+    return ProjectListResponse(
+        project_dir=str(projects_dir),
+        projects=project_items,
+    )
+
+
+@app.post("/project/save", response_model=SaveProjectResponse)
+def post_save_project(request: SaveProjectRequest) -> SaveProjectResponse:
+    ensure_projects_dir()
+    payload = _normalize_project_payload(request.project)
+    if request.autosave:
+        target_name = autosave_project_path().name
+    else:
+        requested_path = str(request.path or "").strip()
+        if not requested_path:
+            raise HTTPException(status_code=400, detail="Project path is required for manual saves.")
+        target_name = requested_path
+
+    try:
+        saved_path = save_project(target_name, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return SaveProjectResponse(
+        path=str(saved_path.resolve()),
+        file_name=saved_path.name,
+        autosave=bool(request.autosave),
+        project_dir=str(user_projects_dir().resolve()),
+    )
+
+
+@app.post("/project/load", response_model=LoadProjectResponse)
+def post_load_project(request: LoadProjectRequest) -> LoadProjectResponse:
+    _, project = _load_project_payload(request.path)
+    resolved_path = resolve_project_path(request.path)
+    return LoadProjectResponse(path=str(resolved_path), project=project)
+
+
+@app.get("/project/autosave", response_model=AutosaveStatusResponse)
+def get_project_autosave() -> AutosaveStatusResponse:
+    autosave_path = autosave_project_path()
+    if not autosave_path.exists():
+        return AutosaveStatusResponse(exists=False, path=str(autosave_path), project=None)
+
+    try:
+        _, project = _load_project_payload(autosave_path.name)
+    except HTTPException:
+        return AutosaveStatusResponse(exists=True, path=str(autosave_path), project=None)
+    return AutosaveStatusResponse(exists=True, path=str(autosave_path), project=project)
 
 
 @app.get("/open-output")

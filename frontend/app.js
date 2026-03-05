@@ -2,11 +2,18 @@ const apiBase = window.location.origin.startsWith("http")
     ? window.location.origin
     : "http://localhost:8000";
 const AUDIO_CROSSFADE_SECONDS = 15.0;
+const AUTOSAVE_INTERVAL_MS = 10000;
+const DEFAULT_UI_SCALE = 1.1;
+const DEFAULT_AUDIO_FILE = "output/final_mix.wav";
 
 const audioTabButton = document.getElementById("audio-tab-button");
 const videoTabButton = document.getElementById("video-tab-button");
 const audioPanel = document.getElementById("audio-panel");
 const videoPanel = document.getElementById("video-panel");
+const openProjectButton = document.getElementById("open-project-button");
+const saveProjectButton = document.getElementById("save-project-button");
+const saveProjectAsButton = document.getElementById("save-project-as-button");
+const interfaceScaleSelect = document.getElementById("interface-scale-select");
 
 const trackListBody = document.getElementById("track-list-body");
 const videoListBody = document.getElementById("video-list-body");
@@ -54,6 +61,12 @@ const state = {
     videoJobId: null,
     videoJobPollHandle: null,
     nextVideoItemId: 1,
+    currentProjectPath: null,
+    audioFile: DEFAULT_AUDIO_FILE,
+    uiScale: DEFAULT_UI_SCALE,
+    autosaveTimerHandle: null,
+    autosaveArmed: false,
+    availableVideos: [],
     sortDirection: {
         bpm: 1,
         key: 1,
@@ -83,6 +96,26 @@ function setStatus(tab, message, type = "") {
 function setRenderProgress(tab, isVisible) {
     const progressElement = tab === "video" ? videoProgressElement : audioProgressElement;
     progressElement.classList.toggle("hidden", !isVisible);
+}
+
+function closeOpenMenus() {
+    document.querySelectorAll(".menu-wrap[open]").forEach((menu) => {
+        menu.removeAttribute("open");
+    });
+}
+
+function parseLoopCount(value) {
+    return Math.max(1, Math.floor(Number(value) || 1));
+}
+
+function setUiScale(value) {
+    const parsed = Number(value);
+    const clamped = Math.max(0.9, Math.min(1.5, Number.isFinite(parsed) ? parsed : DEFAULT_UI_SCALE));
+    state.uiScale = Math.round(clamped * 100) / 100;
+    document.documentElement.style.setProperty("--ui-scale", String(state.uiScale));
+    if (interfaceScaleSelect) {
+        interfaceScaleSelect.value = String(state.uiScale);
+    }
 }
 
 function formatBpm(bpm) {
@@ -190,7 +223,7 @@ function clampPercent(value) {
 }
 
 function createVideoQueueItem(video, loopCount = 1) {
-    const parsedLoopCount = Math.max(1, Math.floor(Number(loopCount) || 1));
+    const parsedLoopCount = parseLoopCount(loopCount);
     return {
         ...video,
         loop_count: parsedLoopCount,
@@ -408,13 +441,15 @@ function renderVideos() {
             const [movedVideo] = state.videos.splice(fromIndex, 1);
             state.videos.splice(toIndex, 0, movedVideo);
             renderVideos();
+            scheduleAutosave();
         });
 
         const loopInput = row.querySelector(".video-loop-input");
         loopInput?.addEventListener("change", () => {
-            const parsed = Math.max(1, Math.floor(Number(loopInput.value) || 1));
+            const parsed = parseLoopCount(loopInput.value);
             loopInput.value = String(parsed);
             state.videos[index].loop_count = parsed;
+            scheduleAutosave();
         });
 
         const cloneButton = row.querySelector(".video-clone-button");
@@ -422,12 +457,14 @@ function renderVideos() {
             const clonedItem = createVideoQueueItem(videoItem, videoItem.loop_count);
             state.videos.splice(index + 1, 0, clonedItem);
             renderVideos();
+            scheduleAutosave();
         });
 
         const removeButton = row.querySelector(".video-remove-button");
         removeButton?.addEventListener("click", () => {
             state.videos.splice(index, 1);
             renderVideos();
+            scheduleAutosave();
         });
 
         videoListBody.appendChild(row);
@@ -467,8 +504,10 @@ async function fetchVideos() {
         }
 
         const videoList = payload.videos ?? [];
+        state.availableVideos = videoList;
         state.videos = videoList.map((video) => createVideoQueueItem(video, 1));
         renderVideos();
+        scheduleAutosave();
     } catch (error) {
         setStatus("video", error.message, "error");
     }
@@ -500,7 +539,7 @@ async function fetchVideoRenderProfiles() {
 function buildVideoItemsPayload() {
     return state.videos.map((video) => ({
         file_name: video.file_name,
-        loop_count: Math.max(1, Math.floor(Number(video.loop_count) || 1))
+        loop_count: parseLoopCount(video.loop_count)
     }));
 }
 
@@ -511,6 +550,230 @@ function buildTransitionPayload() {
         duration: Math.max(0.2, Math.min(3.0, Number(state.videoTransition.duration) || 1.0)),
         curve: String(state.videoTransition.curve || "linear").toLowerCase()
     };
+}
+
+function buildProjectPayload() {
+    return {
+        format: "flowmix",
+        version: 1,
+        ordered_clips: state.videos.map((video) => String(video.file_name || "")),
+        loop_counts: state.videos.map((video) => parseLoopCount(video.loop_count)),
+        transition: buildTransitionPayload(),
+        audio_file: state.audioFile || DEFAULT_AUDIO_FILE,
+        render_settings: {
+            render_profile: state.selectedRenderProfile || "balanced",
+            interface_scale: state.uiScale
+        }
+    };
+}
+
+async function save_project(path) {
+    const response = await fetch(`${apiBase}/project/save`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+            path,
+            project: buildProjectPayload(),
+            autosave: false
+        })
+    });
+
+    if (!response.ok) {
+        const message = await readApiError(response, `Project save failed (HTTP ${response.status}).`);
+        throw new Error(message);
+    }
+
+    return response.json();
+}
+
+async function load_project(path) {
+    const response = await fetch(`${apiBase}/project/load`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path })
+    });
+    if (!response.ok) {
+        const message = await readApiError(response, `Project load failed (HTTP ${response.status}).`);
+        throw new Error(message);
+    }
+    return response.json();
+}
+
+function applyProjectPayload(project) {
+    const orderedClips = Array.isArray(project?.ordered_clips) ? project.ordered_clips : [];
+    const loopCounts = Array.isArray(project?.loop_counts) ? project.loop_counts : [];
+    const transition = project?.transition || {};
+    const renderSettings = project?.render_settings || {};
+
+    if (orderedClips.length !== loopCounts.length) {
+        throw new Error("Project file has mismatched clip and loop arrays.");
+    }
+
+    const availableByName = new Map(state.availableVideos.map((video) => [video.file_name, video]));
+    state.videos = orderedClips.map((fileName, index) => {
+        const base = availableByName.get(fileName) || {
+            file_name: fileName,
+            duration_seconds: 0,
+            width: null,
+            height: null,
+            frame_rate: null
+        };
+        return createVideoQueueItem(base, parseLoopCount(loopCounts[index]));
+    });
+
+    state.videoTransition.type = String(transition.type || "fade").toLowerCase();
+    state.videoTransition.curve = String(transition.curve || "linear").toLowerCase();
+    state.videoTransition.duration = Math.max(0.2, Math.min(3.0, Number(transition.duration) || 1.0));
+    state.videoTransition.enabled = Boolean(transition.enabled ?? true);
+
+    state.audioFile = String(project?.audio_file || DEFAULT_AUDIO_FILE);
+    const requestedProfile = String(renderSettings.render_profile || "balanced").toLowerCase();
+    state.selectedRenderProfile = requestedProfile;
+    setUiScale(renderSettings.interface_scale ?? DEFAULT_UI_SCALE);
+
+    renderProfileOptions();
+    syncTransitionControls();
+    renderVideos();
+}
+
+async function listProjects() {
+    const response = await fetch(`${apiBase}/projects`);
+    if (!response.ok) {
+        const message = await readApiError(response, `Failed to list projects (HTTP ${response.status}).`);
+        throw new Error(message);
+    }
+    return response.json();
+}
+
+async function saveProjectAs() {
+    try {
+        const defaultName = "project.flowmix";
+        const requestedName = window.prompt("Save Project As (.flowmix)", defaultName);
+        if (!requestedName) {
+            return;
+        }
+
+        const normalizedName = requestedName.trim().toLowerCase().endsWith(".flowmix")
+            ? requestedName.trim()
+            : `${requestedName.trim()}.flowmix`;
+        const saved = await save_project(normalizedName);
+        state.currentProjectPath = saved.path;
+        setStatus("video", `Project saved: ${saved.path}`, "success");
+    } catch (error) {
+        setStatus("video", error.message, "error");
+    }
+}
+
+async function saveProject() {
+    try {
+        if (!state.currentProjectPath) {
+            await saveProjectAs();
+            return;
+        }
+
+        const saved = await save_project(state.currentProjectPath);
+        state.currentProjectPath = saved.path;
+        setStatus("video", `Project saved: ${saved.path}`, "success");
+    } catch (error) {
+        setStatus("video", error.message, "error");
+    }
+}
+
+async function openProject() {
+    try {
+        const listing = await listProjects();
+        const projectFiles = listing.projects || [];
+        if (projectFiles.length === 0) {
+            setStatus("video", `No project files found in ${listing.project_dir}.`, "error");
+            return;
+        }
+
+        const optionsText = projectFiles.map((item, index) => `${index + 1}. ${item.file_name}`).join("\n");
+        const selected = window.prompt(
+            `Open Project\n${optionsText}\n\nEnter a number or file name:`,
+            projectFiles[0].file_name
+        );
+        if (!selected) {
+            return;
+        }
+
+        const parsedIndex = Number(selected);
+        let chosenFile = null;
+        if (Number.isInteger(parsedIndex) && parsedIndex >= 1 && parsedIndex <= projectFiles.length) {
+            chosenFile = projectFiles[parsedIndex - 1];
+        } else {
+            const normalizedSelection = selected.trim().toLowerCase();
+            chosenFile = projectFiles.find((item) => item.file_name.toLowerCase() === normalizedSelection) || null;
+        }
+        if (!chosenFile) {
+            throw new Error("Selected project was not found.");
+        }
+
+        const payload = await load_project(chosenFile.file_name);
+        applyProjectPayload(payload.project);
+        state.currentProjectPath = payload.path;
+        setStatus("video", `Project loaded: ${payload.path}`, "success");
+    } catch (error) {
+        setStatus("video", error.message, "error");
+    }
+}
+
+async function autosaveProject() {
+    if (!state.autosaveArmed) {
+        return;
+    }
+    try {
+        await fetch(`${apiBase}/project/save`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                project: buildProjectPayload(),
+                autosave: true
+            })
+        });
+    } catch (error) {
+        console.error("Autosave failed", error);
+    }
+}
+
+function scheduleAutosave() {
+    void autosaveProject();
+}
+
+function startAutosaveLoop() {
+    if (state.autosaveTimerHandle) {
+        window.clearInterval(state.autosaveTimerHandle);
+    }
+    state.autosaveArmed = true;
+    state.autosaveTimerHandle = window.setInterval(() => {
+        void autosaveProject();
+    }, AUTOSAVE_INTERVAL_MS);
+}
+
+async function maybeRestoreAutosave() {
+    try {
+        const response = await fetch(`${apiBase}/project/autosave`);
+        if (!response.ok) {
+            return;
+        }
+
+        const payload = await response.json();
+        if (!payload?.exists || !payload.project) {
+            return;
+        }
+
+        const savedAt = payload.project.saved_at ? ` (${payload.project.saved_at})` : "";
+        const shouldRestore = window.confirm(`Restore autosaved project${savedAt}?`);
+        if (!shouldRestore) {
+            return;
+        }
+
+        applyProjectPayload(payload.project);
+        state.currentProjectPath = null;
+        setStatus("video", `Autosave restored from ${payload.path}. Use Save Project As to keep it.`, "success");
+    } catch (error) {
+        setStatus("video", `Autosave restore failed: ${error.message}`, "error");
+    }
 }
 
 async function readApiError(response, fallbackMessage) {
@@ -851,6 +1114,7 @@ function sortVideosByTitle() {
 
     updateSortButtonLabel(sortVideoAzButton, "Sort A-Z", state.sortDirection.videoTitle);
     renderVideos();
+    scheduleAutosave();
 }
 
 function camelotToSortable(key) {
@@ -896,6 +1160,18 @@ refreshVideoButton.addEventListener("click", fetchVideos);
 renderButton.addEventListener("click", renderMix);
 masterVideoButton.addEventListener("click", generateVideo);
 previewVideoButton?.addEventListener("click", generatePreview);
+openProjectButton?.addEventListener("click", () => {
+    closeOpenMenus();
+    void openProject();
+});
+saveProjectButton?.addEventListener("click", () => {
+    closeOpenMenus();
+    void saveProject();
+});
+saveProjectAsButton?.addEventListener("click", () => {
+    closeOpenMenus();
+    void saveProjectAs();
+});
 openSourceAudioButton.addEventListener("click", () => openSourceFolder("audio"));
 openSourceVideoButton.addEventListener("click", () => openSourceFolder("video"));
 openOutputAudioButton.addEventListener("click", () => openOutputFolder("audio"));
@@ -906,32 +1182,54 @@ sortAzButton.addEventListener("click", sortByTitle);
 sortVideoAzButton.addEventListener("click", sortVideosByTitle);
 renderProfileSelect?.addEventListener("change", () => {
     state.selectedRenderProfile = renderProfileSelect.value;
+    scheduleAutosave();
 });
 transitionTypeSelect?.addEventListener("change", () => {
     state.videoTransition.type = String(transitionTypeSelect.value || "fade").toLowerCase();
     syncTransitionControls();
+    scheduleAutosave();
 });
 transitionCurveSelect?.addEventListener("change", () => {
     state.videoTransition.curve = String(transitionCurveSelect.value || "linear").toLowerCase();
     syncTransitionControls();
+    scheduleAutosave();
 });
 transitionDurationRange?.addEventListener("input", () => {
     const parsed = Math.max(0.2, Math.min(3.0, Number(transitionDurationRange.value) || 1.0));
     state.videoTransition.duration = Math.round(parsed * 10) / 10;
     syncTransitionControls();
+    scheduleAutosave();
+});
+interfaceScaleSelect?.addEventListener("change", () => {
+    setUiScale(interfaceScaleSelect.value);
+    scheduleAutosave();
 });
 
-window.addEventListener("load", () => {
+document.addEventListener("click", (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) {
+        return;
+    }
+    if (target.closest(".menu-wrap")) {
+        return;
+    }
+    closeOpenMenus();
+});
+
+window.addEventListener("load", async () => {
     updateSortButtonLabel(sortBpmButton, "Sort BPM", state.sortDirection.bpm);
     updateSortButtonLabel(sortKeyButton, "Sort Key", state.sortDirection.key);
     updateSortButtonLabel(sortAzButton, "Sort A-Z", state.sortDirection.title);
     updateSortButtonLabel(sortVideoAzButton, "Sort A-Z", state.sortDirection.videoTitle);
+    setUiScale(DEFAULT_UI_SCALE);
     renderProfileOptions();
     syncTransitionControls();
     setVideoProgress(0);
     setVideoEta(null);
     setActiveTab("audio");
-    fetchTracks();
-    fetchVideoRenderProfiles();
-    fetchVideos();
+    await fetchTracks();
+    await fetchVideoRenderProfiles();
+    await fetchVideos();
+    await maybeRestoreAutosave();
+    startAutosaveLoop();
 });

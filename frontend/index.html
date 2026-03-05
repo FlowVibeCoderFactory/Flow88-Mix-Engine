@@ -13,6 +13,31 @@
                 <p class="eyebrow">Flow88 Mix Engine</p>
                 <h1>Master Console</h1>
             </div>
+            <div class="topbar-actions">
+                <details class="menu-wrap">
+                    <summary class="menu-button" role="button">File</summary>
+                    <div class="menu-panel" role="menu" aria-label="File menu">
+                        <button id="open-project-button" class="menu-item-button" type="button">Open Project</button>
+                        <button id="save-project-button" class="menu-item-button" type="button">Save Project</button>
+                        <button id="save-project-as-button" class="menu-item-button" type="button">Save Project As</button>
+                    </div>
+                </details>
+                <details class="menu-wrap">
+                    <summary class="menu-button" role="button">Settings</summary>
+                    <div class="menu-panel" role="menu" aria-label="Settings menu">
+                        <label class="settings-field" for="interface-scale-select">
+                            <span>Interface Scale</span>
+                            <select id="interface-scale-select" class="profile-select">
+                                <option value="0.9">90%</option>
+                                <option value="1.0">100%</option>
+                                <option value="1.1" selected>110%</option>
+                                <option value="1.25">125%</option>
+                                <option value="1.5">150%</option>
+                            </select>
+                        </label>
+                    </div>
+                </details>
+            </div>
         </header>
 
         <nav class="tab-nav" role="tablist" aria-label="Master modes">

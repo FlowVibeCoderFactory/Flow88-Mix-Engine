@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -40,6 +41,16 @@ MIN_TRANSITION_DURATION_SECONDS = 0.2
 MAX_TRANSITION_DURATION_SECONDS = 3.0
 SUPPORTED_TRANSITION_CURVES = {"linear", "easein", "easeout"}
 TRANSITION_TYPE_PATTERN = re.compile(r"^[A-Za-z0-9_]+$")
+PREVIEW_XFADE_WIDTH = 1920
+PREVIEW_XFADE_HEIGHT = 1080
+PREVIEW_XFADE_FPS = 30
+PREVIEW_XFADE_PIX_FMT = "yuv420p"
+MIN_SCENE_DURATION_EPSILON = 0.001
+NVENC_PROBE_WIDTH = 1280
+NVENC_PROBE_HEIGHT = 720
+NVENC_PROBE_FPS = 30
+NVENC_PROBE_FRAMES = 30
+NVENC_PROBE_PRESET = "p3"
 RENDER_PROFILES = {
     "preview": {
         "fps": 12,
@@ -139,6 +150,8 @@ class FFmpegCapabilities:
     hwaccels: tuple[str, ...]
     nvenc_runtime_available: bool
     nvenc_runtime_error: str | None
+    nvenc_probe_command: tuple[str, ...] | None
+    nvenc_probe_result: str | None
 
     @property
     def nvenc_available(self) -> bool:
@@ -164,6 +177,8 @@ class FFmpegCapabilities:
             "cuda_hwaccel_available": self.cuda_hwaccel_available,
             "nvenc_runtime_available": self.nvenc_runtime_available,
             "nvenc_runtime_error": self.nvenc_runtime_error,
+            "nvenc_probe_command": shlex.join(self.nvenc_probe_command) if self.nvenc_probe_command is not None else None,
+            "nvenc_probe_result": self.nvenc_probe_result,
             "preferred_h264_encoder": self.preferred_h264_encoder,
         }
 
@@ -329,13 +344,15 @@ def _resolve_xfade_transition_name(transition: TransitionConfig) -> str:
 def _run_command(command: list[str], error_prefix: str, logger: logging.Logger | None = None) -> str:
     if command and command[0] == "ffmpeg":
         log_structured(logger, "ffmpeg_call", command=command, stage=error_prefix)
+    command_text = shlex.join(command)
     try:
         result = subprocess.run(command, check=True, capture_output=True, text=True)
     except subprocess.CalledProcessError as exc:
         if command and command[0] == "ffmpeg" and logger is not None:
             logger.exception("Render failed")
         stderr = exc.stderr.strip() if exc.stderr else ""
-        raise RuntimeError(f"{error_prefix}: {stderr}") from exc
+        details = stderr or (exc.stdout.strip() if exc.stdout else "") or "command failed with no output."
+        raise RuntimeError(f"{error_prefix}: {details} | command: {command_text}") from exc
 
     return (result.stdout or "") + (result.stderr or "")
 
@@ -367,38 +384,50 @@ def _parse_ffmpeg_hwaccels(output: str) -> tuple[str, ...]:
     return tuple(sorted(set(hwaccels)))
 
 
-def _probe_nvenc_runtime() -> tuple[bool, str | None]:
+def _build_nvenc_probe_command(ffmpeg_path: str) -> list[str]:
+    return [
+        ffmpeg_path,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        f"testsrc2=size={NVENC_PROBE_WIDTH}x{NVENC_PROBE_HEIGHT}:rate={NVENC_PROBE_FPS}",
+        "-frames:v",
+        str(NVENC_PROBE_FRAMES),
+        "-vf",
+        f"format={PREVIEW_XFADE_PIX_FMT}",
+        "-an",
+        "-c:v",
+        "h264_nvenc",
+        "-preset",
+        NVENC_PROBE_PRESET,
+        "-pix_fmt",
+        PREVIEW_XFADE_PIX_FMT,
+        "-f",
+        "null",
+        "-",
+    ]
+
+
+def _probe_nvenc_runtime(ffmpeg_path: str) -> tuple[bool, tuple[str, ...], str | None]:
+    command = tuple(_build_nvenc_probe_command(ffmpeg_path))
     try:
         result = subprocess.run(
-            [
-                "ffmpeg",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                "color=c=black:s=64x64:d=0.1",
-                "-frames:v",
-                "1",
-                "-c:v",
-                "h264_nvenc",
-                "-f",
-                "null",
-                "-",
-            ],
+            list(command),
             check=True,
             capture_output=True,
             text=True,
         )
     except OSError as exc:
-        return False, str(exc)
+        return False, command, str(exc)
     except subprocess.CalledProcessError as exc:
         error_text = (exc.stderr or exc.stdout or "").strip()
-        return False, error_text or "NVENC probe failed."
+        return False, command, error_text or "NVENC probe failed."
 
     output_text = (result.stderr or result.stdout or "").strip()
-    return True, output_text or None
+    return True, command, output_text or "NVENC probe succeeded."
 
 
 @lru_cache(maxsize=1)
@@ -410,8 +439,11 @@ def _get_ffmpeg_capabilities_cached() -> FFmpegCapabilities:
     hwaccels: tuple[str, ...] = ()
     nvenc_runtime_available = False
     nvenc_runtime_error: str | None = None
+    nvenc_probe_command: tuple[str, ...] | None = None
+    nvenc_probe_result: str | None = "Skipped: ffmpeg not found."
 
     if ffmpeg_path is not None:
+        nvenc_probe_result = "Skipped: h264_nvenc encoder not detected."
         try:
             encoders_output = _run_command(
                 ["ffmpeg", "-hide_banner", "-encoders"],
@@ -431,7 +463,9 @@ def _get_ffmpeg_capabilities_cached() -> FFmpegCapabilities:
             hwaccels = ()
 
         if "h264_nvenc" in encoders:
-            nvenc_runtime_available, nvenc_runtime_error = _probe_nvenc_runtime()
+            nvenc_runtime_available, nvenc_probe_command, nvenc_probe_result = _probe_nvenc_runtime(ffmpeg_path)
+            if not nvenc_runtime_available:
+                nvenc_runtime_error = nvenc_probe_result
 
     return FFmpegCapabilities(
         ffmpeg_path=ffmpeg_path,
@@ -440,6 +474,8 @@ def _get_ffmpeg_capabilities_cached() -> FFmpegCapabilities:
         hwaccels=hwaccels,
         nvenc_runtime_available=nvenc_runtime_available,
         nvenc_runtime_error=nvenc_runtime_error,
+        nvenc_probe_command=nvenc_probe_command,
+        nvenc_probe_result=nvenc_probe_result,
     )
 
 
@@ -493,6 +529,7 @@ def _run_ffmpeg_with_progress(
     logger: logging.Logger | None = None,
 ) -> None:
     log_structured(logger, "ffmpeg_call", command=command, stage=error_prefix)
+    command_text = shlex.join(command)
     try:
         process = subprocess.Popen(
             command,
@@ -504,10 +541,10 @@ def _run_ffmpeg_with_progress(
     except OSError as exc:
         if logger is not None:
             logger.exception("Render failed")
-        raise RuntimeError(f"{error_prefix}: {exc}") from exc
+        raise RuntimeError(f"{error_prefix}: {exc} | command: {command_text}") from exc
 
     if process.stdout is None:
-        raise RuntimeError(f"{error_prefix}: unable to stream ffmpeg output.")
+        raise RuntimeError(f"{error_prefix}: unable to stream ffmpeg output. | command: {command_text}")
 
     error_tail: list[str] = []
 
@@ -541,7 +578,7 @@ def _run_ffmpeg_with_progress(
 
     if process.returncode != 0:
         details = " | ".join(error_tail[-5:]) if error_tail else "ffmpeg exited with no output."
-        raise RuntimeError(f"{error_prefix}: {details}")
+        raise RuntimeError(f"{error_prefix}: {details} | command: {command_text}")
 
 
 def _write_filter_script(filter_complex: str, script_path: Path) -> None:
@@ -821,6 +858,8 @@ def _build_scene_sequence(
         clip_index = (clip_index + 1) % len(validated_clips)
 
     return sequence
+
+
 def _build_scene_filtergraph(
     scenes: list[SceneSegment],
     target_duration_seconds: float,
@@ -832,22 +871,44 @@ def _build_scene_filtergraph(
 
     filter_parts: list[str] = []
     for index, scene in enumerate(scenes):
-        chain_parts = [
-            f"trim=duration={scene.duration_seconds:.6f}",
-            "setpts=PTS-STARTPTS",
-        ]
+        chain_parts = [f"trim=duration={scene.duration_seconds:.6f}"]
+        if settings.mode == "preview":
+            chain_parts.extend(
+                [
+                    f"scale={PREVIEW_XFADE_WIDTH}:{PREVIEW_XFADE_HEIGHT}:force_original_aspect_ratio=decrease",
+                    f"pad={PREVIEW_XFADE_WIDTH}:{PREVIEW_XFADE_HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black",
+                    f"fps={PREVIEW_XFADE_FPS}",
+                    f"format={PREVIEW_XFADE_PIX_FMT}",
+                    "setsar=1",
+                ]
+            )
+        chain_parts.append("setpts=PTS-STARTPTS")
 
         source_label = f"{index}:v"
         filter_parts.append(f"[{source_label}]{','.join(chain_parts)}[v{index}]")
 
+    output_chain_parts = [f"trim=duration={target_duration_seconds:.6f}"]
+    if settings.mode == "preview":
+        output_chain_parts.extend(
+            [
+                f"scale={settings.width}:{settings.height}:force_original_aspect_ratio=decrease",
+                f"pad={settings.width}:{settings.height}:(ow-iw)/2:(oh-ih)/2:color=black",
+                f"fps={settings.fps}",
+                f"format={PREVIEW_XFADE_PIX_FMT}",
+                "setsar=1",
+            ]
+        )
+    output_chain_parts.append("setpts=PTS-STARTPTS")
+    output_chain = ",".join(output_chain_parts)
+
     if len(scenes) == 1:
-        filter_parts.append(f"[v0]trim=duration={target_duration_seconds:.6f},setpts=PTS-STARTPTS[vout]")
+        filter_parts.append(f"[v0]{output_chain}[vout]")
         return ";".join(filter_parts)
 
     if not transition.enabled or transition.overlap_seconds <= 0:
         concat_inputs = "".join(f"[v{index}]" for index in range(len(scenes)))
         filter_parts.append(f"{concat_inputs}concat=n={len(scenes)}:v=1:a=0[vcat]")
-        filter_parts.append(f"[vcat]trim=duration={target_duration_seconds:.6f},setpts=PTS-STARTPTS[vout]")
+        filter_parts.append(f"[vcat]{output_chain}[vout]")
         return ";".join(filter_parts)
 
     transition_name = _resolve_xfade_transition_name(transition)
@@ -856,24 +917,35 @@ def _build_scene_filtergraph(
 
     for index in range(1, len(scenes)):
         next_label = f"x{index}"
-
-        xfade_offset = max(0.0, timeline_cursor - transition.duration_seconds)
+        previous_scene = scenes[index - 1]
+        current_scene = scenes[index]
+        max_transition_duration = min(
+            previous_scene.duration_seconds - MIN_SCENE_DURATION_EPSILON,
+            current_scene.duration_seconds - MIN_SCENE_DURATION_EPSILON,
+        )
+        if max_transition_duration <= 0:
+            raise ValueError(
+                f"Scene transition invalid between '{previous_scene.file_path.name}' and "
+                f"'{current_scene.file_path.name}': at least one scene is too short for xfade."
+            )
+        xfade_duration = min(transition.duration_seconds, max_transition_duration)
+        xfade_offset = max(0.0, timeline_cursor - xfade_duration)
 
         filter_parts.append(
             f"[{current_label}][v{index}]xfade="
             f"transition={transition_name}:"
-            f"duration={transition.duration_seconds:.6f}:"
+            f"duration={xfade_duration:.6f}:"
             f"offset={xfade_offset:.6f}"
             f"[{next_label}]"
         )
 
         current_label = next_label
-        timeline_cursor += scenes[index].duration_seconds - transition.duration_seconds
+        timeline_cursor += current_scene.duration_seconds - xfade_duration
 
-    filter_parts.append(
-        f"[{current_label}]trim=duration={target_duration_seconds:.6f},setpts=PTS-STARTPTS[vout]"
-    )
+    filter_parts.append(f"[{current_label}]{output_chain}[vout]")
     return ";".join(filter_parts)
+
+
 def _render_scene_chunk(
     chunk_scenes: list[SceneSegment],
     chunk_index: int,
@@ -919,8 +991,6 @@ def _render_scene_chunk(
             str(settings.fps),
         ]
     )
-    if settings.enable_color_conversion:
-        command.extend(["-pix_fmt", "yuv420p"])
 
     if encoder == "h264_nvenc":
         command.extend(
@@ -929,6 +999,8 @@ def _render_scene_chunk(
                 "h264_nvenc",
                 "-preset",
                 settings.nvenc_preset,
+                "-pix_fmt",
+                PREVIEW_XFADE_PIX_FMT,
                 "-rc",
                 "vbr",
                 "-cq",
@@ -938,6 +1010,8 @@ def _render_scene_chunk(
             ]
         )
     else:
+        if settings.enable_color_conversion:
+            command.extend(["-pix_fmt", PREVIEW_XFADE_PIX_FMT])
         command.extend(
             [
                 "-c:v",
@@ -1435,6 +1509,11 @@ def render_final_video(
         reason=encoder_reason,
         ffmpeg_path=capabilities.ffmpeg_path,
         ffprobe_path=capabilities.ffprobe_path,
+        nvenc_runtime_available=capabilities.nvenc_runtime_available,
+        nvenc_probe_command=shlex.join(capabilities.nvenc_probe_command)
+        if capabilities.nvenc_probe_command is not None
+        else None,
+        nvenc_probe_result=capabilities.nvenc_probe_result,
         hwaccels=list(capabilities.hwaccels),
         encoders=list(capabilities.encoders),
     )

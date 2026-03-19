@@ -1,92 +1,88 @@
 # Flow88 Mix Engine
 
-Flow88 Mix Engine is a Python audio/video mastering app that now supports both local use and headless server deployment.
+Flow88 Mix Engine is a browser-based audio mix and video mastering tool. The current repo supports local use, but the active deployment model is a headless FastAPI server running on a DGX Spark style machine and serving the UI over the network.
 
-- Audio: analyze BPM/key, reorder tracks, and render a continuous mixed WAV.
-- Video: queue clips, set loop counts, configure transitions, preflight, and render final/preview video.
-- Deployment: run the existing browser UI through FastAPI locally or as a remote DGX Spark render node.
+For a quick handoff, start with [PROJECT_CONTEXT.md](PROJECT_CONTEXT.md) and [PROJECT_TREE.md](PROJECT_TREE.md).
 
-## Screenshots
+## What This Project Is
 
-### Desktop Queue
+This project lets a user:
 
-![Flow88 desktop queue](docs/screenshots/app-desktop.png)
+- analyze source audio files for BPM, key, duration, and trim bounds
+- order a mix queue and render a single mastered WAV plus tracklist
+- build a video queue from source clips, set loop counts and transitions, run preflight, and render a preview or final video
+- manage input, output, and project files from the browser
 
-### Mobile/Narrow Layout
+## Key Features
 
-![Flow88 mobile queue](docs/screenshots/app-mobile.png)
+- FastAPI backend with the frontend served from the same app
+- Audio analysis with `ffprobe`, `mutagen`, and `librosa`
+- Audio mix render with FFmpeg `acrossfade` plus `loudnorm`
+- Video queue with drag/drop ordering, loop counts, and transition controls
+- Preview render, final render, and background job polling
+- `.flowmix` save/load/autosave support
+- Managed browser file operations for input, video input, output, and projects
+- Health and diagnostics endpoints for deployment checks
+- NVENC probing with CPU fallback
 
-## Features
+## DGX Spark / Headless Deployment Model
 
-- Analyze audio in the configured input directory (`.mp3`, `.wav`, `.flac`, `.m4a`, `.aac`, `.ogg`)
-- Extract precise duration with `ffprobe`
-- Detect BPM, musical key, and Camelot harmonic key
-- Drag/drop sorting for audio and video queues
-- Audio mix rendering with FFmpeg `acrossfade` + `loudnorm`
-- Video rendering from the configured video input directory with configurable transitions
-- Preview renders, render preflight checks, and background job polling
-- FastAPI-served frontend at `/`
-- `/health` and `/diagnostics` endpoints for deployment checks
-- Explicit FFmpeg/NVENC diagnostics with CPU fallback
-- Browser-based file management for input, video input, output, and project files
+The DGX Spark version is server-first:
 
-## Requirements
+- the DGX box runs the container
+- FastAPI serves both the API and the browser UI on port `8000`
+- runtime data lives on the host under `/srv/flow88/*`
+- users connect from another machine through a browser
+- Samba, Tailscale, and any other file-sharing or remote-access layer live outside the app
 
-- Python 3.11+
-- FFmpeg and FFprobe available in `PATH`
-- Web/server mode: Windows, macOS, or Linux
-- Desktop wrapper: optional and installed separately via `requirements/desktop.txt`
+This is different from the older local mode, which still exists through `desktop_app.py` and local default folders.
 
-## Quick Start
+## Architecture Summary
 
-1. Create and activate a virtual environment.
+- `server.py` is the main entrypoint and API layer.
+- `frontend/` contains the single-page UI.
+- `analyzer.py` scans and analyzes audio.
+- `mixer.py` builds the audio timeline and renders `final_mix.wav`.
+- `video_processor.py` handles video probing, transition graphs, preflight, chunked rendering, muxing, and NVENC checks.
+- `project_persistence.py` stores `.flowmix` project files and autosave.
+- `file_manager.py` keeps browser file operations inside managed directories.
+- `runtime_config.py` reads environment variables for paths, host/port, CORS, and upload limits.
+
+## Folder Layout Summary
+
+- `frontend/`: browser UI
+- `requirements/`: split dependency sets for base, server, and desktop
+- `docs/screenshots/`: current generic UI screenshots
+- `docker-data/`: repo-local sample runtime folders from older/local workflows
+- `/srv/flow88/input`: DGX audio input
+- `/srv/flow88/input/videos`: DGX video input
+- `/srv/flow88/output`: renders and temporary video work files
+- `/srv/flow88/projects`: saved `.flowmix` files
+- `/srv/flow88/logs`: render logs
+
+Important: the current `docker-compose.yml` binds absolute host paths under `/srv/flow88/*`. The repo-local `docker-data/` folders are not the active compose mount points.
+
+## Setup
+
+Local Python setup:
 
 ```bash
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
-```
-
-Windows PowerShell:
-
-```powershell
-.\.venv\Scripts\Activate.ps1
-```
-
-2. Install server dependencies.
-
-```bash
 pip install -r requirements.txt
-```
-
-3. Put source files in the default directories:
-
-- Audio: `input/`
-- Video: `input/videos/`
-
-4. Start the FastAPI app.
-
-```bash
-python server.py
+python3 server.py
 ```
 
 Then open `http://127.0.0.1:8000`.
 
-Optional desktop wrapper:
+Optional local desktop wrapper:
 
 ```bash
 pip install -r requirements/desktop.txt
-python desktop_app.py
+python3 desktop_app.py
 ```
 
-Windows helper script:
-
-```bat
-runMixer.bat
-```
-
-## Runtime Configuration
-
-These environment variables keep local and Docker usage aligned:
+Useful environment variables:
 
 - `FLOW88_INPUT_DIR`
 - `FLOW88_OUTPUT_DIR`
@@ -97,168 +93,137 @@ These environment variables keep local and Docker usage aligned:
 - `FLOW88_PORT`
 - `FLOW88_MAX_UPLOAD_SIZE_BYTES`
 
-Defaults remain local-friendly:
+Defaults:
 
-- Input: `./input`
-- Video input: `./input/videos`
-- Output: `./output`
-- Logs: `./logs`
-- Projects: per-user app data unless `FLOW88_PROJECTS_DIR` is set
-- CORS: `*`
-- Max browser upload size: `8589934592` bytes (8 GiB)
+- input: `./input`
+- video input: `./input/videos`
+- output: `./output`
+- logs: `./logs`
+- projects: user app-data path unless overridden
+- max upload size: `8 GiB`
 
-## DGX Spark Deployment
+## Docker Run Instructions
 
-This repo can run as a headless render/analyze service on NVIDIA DGX Spark. In this mode, the DGX box hosts FastAPI + FFmpeg, and a browser on your main PC connects over the LAN. The desktop wrapper is not required.
-
-### Build
+Create the host folders the compose file expects:
 
 ```bash
-mkdir -p docker-data/input/videos docker-data/output docker-data/projects docker-data/logs
-docker compose build
+sudo mkdir -p /srv/flow88/input/videos /srv/flow88/output /srv/flow88/projects /srv/flow88/logs
 ```
 
-### Run
+Build and start:
 
 ```bash
+docker compose build
 FLOW88_CORS_ORIGINS=http://YOUR-PC-IP:8000 docker compose up -d
 ```
 
-The compose stack:
-
-- Exposes `8000`
-- Installs `ffmpeg` and `ffprobe`
-- Mounts persistent volumes for input, output, projects, and logs
-- Requests NVIDIA GPU access
-- Sets `NVIDIA_DRIVER_CAPABILITIES=compute,video,utility`
-- Includes a healthcheck against `/health`
-
-### Volume Mounts
-
-- `./docker-data/input:/srv/flow88/input`
-- `./docker-data/output:/srv/flow88/output`
-- `./docker-data/projects:/srv/flow88/projects`
-- `./docker-data/logs:/srv/flow88/logs`
-
-Put audio files in `docker-data/input/` and video clips in `docker-data/input/videos/`.
-You can also upload and manage these files from the browser once the service is running.
-
-### LAN Access
-
-Open the service from another machine at:
+Open:
 
 ```text
 http://DGX_SPARK_IP:8000
 ```
 
-If the frontend will be served from a different origin, set `FLOW88_CORS_ORIGINS` to a comma-separated allowlist.
+Useful checks:
 
-### Remote File Management
-
-For DGX Spark and other headless deployments, use the browser UI instead of desktop folder-opening.
-
-- Audio tab `Manage Input`: list, upload, rename, and delete files in the configured input directory.
-- Video tab `Manage Input`: list, upload, rename, and delete files in the configured `input/videos` directory.
-- `Manage Output`: list, download, rename, and delete rendered mixes, previews, logs, and final videos.
-- `Manage Projects`: list, download/export, rename, and delete saved `.flowmix` project files.
-- Deletes require browser confirmation, and all file operations stay restricted to the configured runtime directories.
-- The older `open-*` routes remain for local desktop-style workflows, but the browser file manager is the supported DGX path.
-
-### Shared Folder Workflow
-
-For large audio batches, a mounted/shared folder is usually better than browser upload.
-
-- Point `FLOW88_INPUT_DIR` at a host path backed by your preferred shared storage, then mount that same path into the container.
-- Common options are SMB/CIFS, NFS, Synology/QNAP shares, or a host-managed sync folder that lands inside `docker-data/input/`.
-- Copy large `.wav`, `.flac`, or `.mp3` files into that shared folder from your main PC, then use `Refresh` in the Audio Mix tab to rescan the active input directory.
-- Browser upload is still useful for quick tests and one-off assets, but shared folders are the preferred DGX workflow for bigger libraries.
-
-### Troubleshooting
-
-- `GET /health` confirms the service is up.
-- `GET /diagnostics` shows configured directories, ffmpeg/ffprobe paths, encoders, hwaccels, and the preferred H.264 encoder.
-- If a file shows up in `Manage Input` but not in the Audio Mix table, refresh the library and check whether the file is marked unsupported or whether the Audio Mix status reports an analysis rejection.
-- If renders fall back to CPU, check whether `/diagnostics` shows both `h264_nvenc` and `cuda`.
-- If NVENC is missing in Docker, verify the host has NVIDIA Container Runtime enabled and that `NVIDIA_DRIVER_CAPABILITIES` includes `video`.
-- Inspect container logs with `docker compose logs --tail 100 flow88`.
-
-## How Audio Rendering Works
-
-1. `analyzer.py` discovers files and extracts tags.
-2. `ffprobe` extracts source duration for each track.
-3. `librosa` estimates BPM and key.
-4. `mixer.py` computes timeline starts and total length.
-5. `mixer.py` builds the audio filter graph.
-6. Tracks are chained with `acrossfade`.
-7. `loudnorm` is applied.
-8. Final WAV and tracklist are written to the configured output directory.
-
-## How Video Rendering Works
-
-1. Video items are normalized from queue order and loop counts.
-2. Scene sequence is expanded to match audio duration.
-3. A concat timeline file is generated.
-4. A dynamic transition graph is built with `xfade`.
-5. Render runs in chunks to keep memory usage bounded.
-6. Chunks are stitched, then audio is muxed once.
-7. Encoder selection is logged as either `h264_nvenc` or CPU `libx264`.
-
-## API Endpoints
-
-- `GET /` serves `frontend/index.html`
-- `GET /health` returns service health and encoder summary
-- `GET /diagnostics` returns startup/runtime diagnostics
-- `GET /tracks` returns analyzed tracks
-- `POST /mix` renders the audio mix
-- `GET /videos` returns analyzed videos
-- `POST /render-preflight` validates video render inputs and transition graph
-- `POST /generate-video` queues final video render
-- `POST /generate-preview` queues preview render
-- `GET /video-jobs/{job_id}` polls video render progress
-- `GET /video-render-profiles` lists render profiles
-- `GET /projects` lists saved projects
-- `POST /project/save` saves a project
-- `POST /project/load` loads a project
-- `GET /project/autosave` returns autosave state
-- `GET /api/files/input`, `POST /api/files/input/upload`, `DELETE /api/files/input/{filename}`, `POST /api/files/input/rename`
-- `GET /api/files/input/videos`, `POST /api/files/input/videos/upload`, `DELETE /api/files/input/videos/{filename}`, `POST /api/files/input/videos/rename`
-- `GET /api/files/output`, `GET /api/files/output/{filename}/download`, `DELETE /api/files/output/{filename}`, `POST /api/files/output/rename`
-- `GET /api/files/projects`, `GET /api/files/projects/{filename}/download`, `DELETE /api/files/projects/{filename}`, `POST /api/files/projects/rename`
-- `GET /open-output`, `GET /open-audio-source`, `GET /open-video-source` remain available for local desktop-style workflows, but the browser file manager is the preferred remote path
-
-## Migration Notes
-
-- `requirements.txt` now installs the server path only. Desktop extras live in `requirements/desktop.txt`.
-- The primary mixed-audio output is now `output/final_mix.wav`. Existing `flow88_master_mix.wav` files are still accepted as render input fallback.
-- Runtime directories and CORS can now be configured with environment variables without changing code.
-- Remote browser file management now replaces the old folder-opening workflow for headless DGX usage.
-- `server.py` is the primary entrypoint for local and containerized runs.
-
-## Project Layout
-
-```text
-frontend/
-  index.html
-  app.js
-  styles.css
-requirements/
-  base.txt
-  server.txt
-  desktop.txt
-analyzer.py
-mixer.py
-video_processor.py
-models.py
-tracklist.py
-runtime_config.py
-server.py
-desktop_app.py
-main.py
-Dockerfile
-docker-compose.yml
-LLM_CONTEXT.md
+```bash
+docker compose logs --tail 100 flow88
+curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8000/diagnostics
 ```
 
-## LLM Context File
+## LAN / Tailscale / Samba Notes
 
-Detailed implementation context for AI agents is available in [LLM_CONTEXT.md](LLM_CONTEXT.md).
+- LAN access is the simplest path: browse to `http://DGX_HOST:8000`.
+- Tailscale works the same way if the node and port are reachable.
+- Samba is not configured by this repo, but it fits naturally if the host exports `/srv/flow88/input` and `/srv/flow88/output`.
+- Browser upload is fine for small tests. For large media, copying files into the host-mounted folders is the better workflow.
+
+## Input / Output / Projects Workflow
+
+1. Put audio files in the input folder or upload them from `Manage Input`.
+2. Put video clips in `input/videos` or upload them from the Video tab.
+3. Refresh the Audio Mix tab to analyze tracks.
+4. Render the audio mix. This writes `final_mix.wav` and `tracklist.txt`.
+5. Refresh the Video Master tab, order clips, set loop counts, pick a render tier, and set transitions.
+6. Run a preview or final render.
+7. Download final outputs from `Manage Output`.
+8. Save queue state as a `.flowmix` project file when needed.
+
+## UI Walkthrough
+
+Audio Mix tab:
+
+- `Refresh` rescans and reanalyzes the audio input directory.
+- `Sort BPM`, `Sort Key`, and `Sort A-Z` reorder the track queue.
+- Drag rows to set final mix order.
+- `Render Mix` produces `final_mix.wav`.
+- `Manage Input`, `Manage Output`, and `Manage Projects` open the browser file manager.
+
+Video Master tab:
+
+- `Refresh` rescans the video input directory.
+- Drag clips to order the sequence.
+- Set loop counts per clip.
+- `Render Tier` selects `performance`, `balanced`, or `quality`.
+- Transition controls set type, duration, and curve.
+- `Generate Preview` runs a short preview job.
+- `Master Video` runs preflight and queues the final render.
+
+Project handling:
+
+- `File -> Open Project`
+- `File -> Save Project`
+- `File -> Save Project As`
+- autosave runs in the browser every 10 seconds
+
+## UI Screenshots
+
+Current repo screenshots:
+
+![Desktop overview](docs/screenshots/app-desktop.png)
+Current desktop view of the main console.
+
+![Mobile overview](docs/screenshots/app-mobile.png)
+Narrow/mobile view of the same UI.
+
+Recommended handoff capture set:
+
+Add screenshots to `/screenshots` using the filenames below.
+
+![Main Mixer](screenshots/main-mixer.png)
+Audio Mix tab with analyzed tracks, ordering, and total mix length.
+
+![Manage Input](screenshots/manage-input.png)
+File manager opened on the audio input directory.
+
+![Manage Output](screenshots/manage-output.png)
+File manager opened on rendered outputs and downloadable files.
+
+![Render Preview](screenshots/render-preview.png)
+Video Master tab during or after preview/final render with progress and transition settings visible.
+
+## Troubleshooting
+
+- `GET /health` confirms the service is up.
+- `GET /diagnostics` shows directories, FFmpeg paths, encoders, hwaccels, and preferred H.264 encoder.
+- If `Manage Input` shows files but the Audio Mix table stays empty, refresh and check whether files are marked unsupported or rejected.
+- If `performance` render profile is rejected, the server did not pass the NVENC runtime probe.
+- If renders fall back to CPU, inspect `/diagnostics` and the render log path returned by the job status.
+- If `open-*` folder routes fail on Linux/DGX, that is expected; use the browser file manager or the mounted host folders instead.
+- If browser uploads are slow or large, move media through the host-mounted folders or Samba instead.
+
+## Known Limitations
+
+- No automated tests are included yet.
+- Preview renders are CPU-only and capped to a short timeline.
+- Transition names are validated lightly; unsupported FFmpeg transitions still fail at render time.
+- The repo still contains older local/desktop artifacts alongside the current DGX path.
+- Temporary render/cache files can accumulate under `output/video_work/`.
+
+## Next Improvements
+
+- Add a small end-to-end test pass for audio render, preflight, and preview render.
+- Clean up or clearly separate older local-only scaffolding from the DGX deployment path.
+- Add explicit cleanup for `video_work/`.
+- Document Samba/Tailscale host setup outside the app.
+- Replace the generic screenshots with task-focused captures.

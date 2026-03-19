@@ -68,8 +68,9 @@
                 <div class="primary-actions">
                     <button id="refresh-audio-button" class="refresh-button" type="button">Refresh</button>
                     <button id="render-button" class="render-button" type="button">Render Mix</button>
-                    <button id="open-source-audio-button" class="secondary-action-button" type="button">Open Source Audio</button>
-                    <button id="open-output-audio-button" class="secondary-action-button" type="button">Open Output Folder</button>
+                    <button id="open-source-audio-button" class="secondary-action-button" type="button">Manage Input</button>
+                    <button id="open-output-audio-button" class="secondary-action-button" type="button">Manage Output</button>
+                    <button id="manage-projects-audio-button" class="secondary-action-button" type="button">Manage Projects</button>
                     <div class="sort-controls" role="group" aria-label="Audio sort controls">
                         <button id="sort-bpm-button" class="sort-button" type="button">Sort BPM</button>
                         <button id="sort-key-button" class="sort-button" type="button">Sort Key</button>
@@ -112,8 +113,9 @@
                     <button id="refresh-video-button" class="refresh-button" type="button">Refresh</button>
                     <button id="master-video-button" class="render-button" type="button">Master Video</button>
                     <button id="preview-video-button" class="secondary-action-button" type="button">Generate Preview</button>
-                    <button id="open-source-video-button" class="secondary-action-button" type="button">Open Source Video</button>
-                    <button id="open-output-video-button" class="secondary-action-button" type="button">Open Output Folder</button>
+                    <button id="open-source-video-button" class="secondary-action-button" type="button">Manage Input</button>
+                    <button id="open-output-video-button" class="secondary-action-button" type="button">Manage Output</button>
+                    <button id="manage-projects-video-button" class="secondary-action-button" type="button">Manage Projects</button>
                     <label class="profile-select-wrap" for="render-profile-select">
                         <span>Render Tier</span>
                         <select id="render-profile-select" class="profile-select"></select>
@@ -170,6 +172,58 @@
             </section>
         </section>
     </main>
+
+    <div id="file-manager-modal" class="file-manager-modal hidden" aria-hidden="true">
+        <div id="file-manager-backdrop" class="file-manager-backdrop"></div>
+        <section
+            class="file-manager-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="file-manager-title"
+            aria-describedby="file-manager-directory"
+        >
+            <header class="file-manager-header">
+                <div>
+                    <p class="eyebrow">Remote File Manager</p>
+                    <h2 id="file-manager-title">Manage Files</h2>
+                    <p id="file-manager-directory" class="file-manager-directory"></p>
+                </div>
+                <button id="file-manager-close-button" class="menu-button file-manager-close-button" type="button">Close</button>
+            </header>
+
+            <section class="file-manager-toolbar" aria-label="File manager controls">
+                <div class="file-manager-toolbar-actions">
+                    <label id="file-manager-upload-wrap" class="secondary-action-button file-upload-button hidden">
+                        <input id="file-manager-upload-input" type="file" multiple hidden>
+                        <span id="file-manager-upload-label">Upload Files</span>
+                    </label>
+                    <button id="file-manager-refresh-button" class="refresh-button" type="button">Refresh</button>
+                </div>
+                <p id="file-manager-status" class="file-manager-status">Select a manager to view files.</p>
+            </section>
+
+            <section class="table-shell file-manager-table-shell" aria-label="Managed files">
+                <table class="track-table file-manager-table" role="grid">
+                    <thead>
+                        <tr class="table-header-row">
+                            <th scope="col">
+                                <button id="file-manager-sort-name" class="file-sort-button active" type="button">Name</button>
+                            </th>
+                            <th scope="col">Ext</th>
+                            <th scope="col">
+                                <button id="file-manager-sort-size" class="file-sort-button" type="button">Size</button>
+                            </th>
+                            <th scope="col">
+                                <button id="file-manager-sort-date" class="file-sort-button" type="button">Modified</button>
+                            </th>
+                            <th scope="col">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="file-manager-list-body" aria-live="polite"></tbody>
+                </table>
+            </section>
+        </section>
+    </div>
 
     <script src="/frontend/app.js" defer></script>
 </body>

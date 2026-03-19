@@ -10,6 +10,7 @@ import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 from models import VideoAnalysis
@@ -128,6 +129,43 @@ class RenderSettings:
     @property
     def transition_overlap_seconds(self) -> float:
         return self.transition.overlap_seconds
+
+
+@dataclass(slots=True, frozen=True)
+class FFmpegCapabilities:
+    ffmpeg_path: str | None
+    ffprobe_path: str | None
+    encoders: tuple[str, ...]
+    hwaccels: tuple[str, ...]
+    nvenc_runtime_available: bool
+    nvenc_runtime_error: str | None
+
+    @property
+    def nvenc_available(self) -> bool:
+        return "h264_nvenc" in self.encoders
+
+    @property
+    def cuda_hwaccel_available(self) -> bool:
+        return "cuda" in self.hwaccels
+
+    @property
+    def preferred_h264_encoder(self) -> str:
+        if self.nvenc_runtime_available:
+            return "h264_nvenc"
+        return DEFAULT_VIDEO_CODEC
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "ffmpeg_path": self.ffmpeg_path,
+            "ffprobe_path": self.ffprobe_path,
+            "encoders": list(self.encoders),
+            "hwaccels": list(self.hwaccels),
+            "nvenc_available": self.nvenc_available,
+            "cuda_hwaccel_available": self.cuda_hwaccel_available,
+            "nvenc_runtime_available": self.nvenc_runtime_available,
+            "nvenc_runtime_error": self.nvenc_runtime_error,
+            "preferred_h264_encoder": self.preferred_h264_encoder,
+        }
 
 
 def discover_video_files(input_dir: Path) -> list[Path]:
@@ -302,6 +340,116 @@ def _run_command(command: list[str], error_prefix: str, logger: logging.Logger |
     return (result.stdout or "") + (result.stderr or "")
 
 
+def _parse_ffmpeg_encoders(output: str) -> tuple[str, ...]:
+    encoders: list[str] = []
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("Encoders:") or line.startswith("------"):
+            continue
+
+        parts = line.split()
+        if len(parts) >= 2 and set(parts[0]) <= {".", "V", "A", "S", "D", "F"}:
+            encoders.append(parts[1])
+
+    return tuple(sorted(set(encoders)))
+
+
+def _parse_ffmpeg_hwaccels(output: str) -> tuple[str, ...]:
+    hwaccels: list[str] = []
+    for raw_line in output.splitlines():
+        line = raw_line.strip().lower()
+        if not line or line.startswith("hardware acceleration methods"):
+            continue
+        if " " in line or "\t" in line:
+            continue
+        hwaccels.append(line)
+
+    return tuple(sorted(set(hwaccels)))
+
+
+def _probe_nvenc_runtime() -> tuple[bool, str | None]:
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=64x64:d=0.1",
+                "-frames:v",
+                "1",
+                "-c:v",
+                "h264_nvenc",
+                "-f",
+                "null",
+                "-",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        return False, str(exc)
+    except subprocess.CalledProcessError as exc:
+        error_text = (exc.stderr or exc.stdout or "").strip()
+        return False, error_text or "NVENC probe failed."
+
+    output_text = (result.stderr or result.stdout or "").strip()
+    return True, output_text or None
+
+
+@lru_cache(maxsize=1)
+def _get_ffmpeg_capabilities_cached() -> FFmpegCapabilities:
+    ffmpeg_path = shutil.which("ffmpeg")
+    ffprobe_path = shutil.which("ffprobe")
+
+    encoders: tuple[str, ...] = ()
+    hwaccels: tuple[str, ...] = ()
+    nvenc_runtime_available = False
+    nvenc_runtime_error: str | None = None
+
+    if ffmpeg_path is not None:
+        try:
+            encoders_output = _run_command(
+                ["ffmpeg", "-hide_banner", "-encoders"],
+                error_prefix="Failed to query FFmpeg encoders",
+            )
+            encoders = _parse_ffmpeg_encoders(encoders_output)
+        except RuntimeError:
+            encoders = ()
+
+        try:
+            hwaccel_output = _run_command(
+                ["ffmpeg", "-hide_banner", "-hwaccels"],
+                error_prefix="Failed to query FFmpeg hwaccels",
+            )
+            hwaccels = _parse_ffmpeg_hwaccels(hwaccel_output)
+        except RuntimeError:
+            hwaccels = ()
+
+        if "h264_nvenc" in encoders:
+            nvenc_runtime_available, nvenc_runtime_error = _probe_nvenc_runtime()
+
+    return FFmpegCapabilities(
+        ffmpeg_path=ffmpeg_path,
+        ffprobe_path=ffprobe_path,
+        encoders=encoders,
+        hwaccels=hwaccels,
+        nvenc_runtime_available=nvenc_runtime_available,
+        nvenc_runtime_error=nvenc_runtime_error,
+    )
+
+
+def get_ffmpeg_capabilities(logger: logging.Logger | None = None) -> FFmpegCapabilities:
+    capabilities = _get_ffmpeg_capabilities_cached()
+    if logger is not None:
+        log_structured(logger, "ffmpeg_capabilities", **capabilities.as_dict())
+    return capabilities
+
+
 def _report_render_progress(
     progress_state: RenderProgressState,
     processed_seconds: float,
@@ -442,9 +590,10 @@ def _assembled_duration_seconds(scenes: list[SceneSegment], transition_overlap_s
 
 
 def _require_ffmpeg_tools() -> None:
-    if shutil.which("ffmpeg") is None:
+    capabilities = get_ffmpeg_capabilities()
+    if capabilities.ffmpeg_path is None:
         raise RuntimeError("ffmpeg not found in PATH.")
-    if shutil.which("ffprobe") is None:
+    if capabilities.ffprobe_path is None:
         raise RuntimeError("ffprobe not found in PATH.")
 
 
@@ -523,22 +672,11 @@ def analyze_video_directory(input_dir: Path) -> list[VideoAnalysis]:
 
 
 def detect_h264_encoder() -> str:
-    encoder_output = _run_command(
-        ["ffmpeg", "-hide_banner", "-encoders"],
-        error_prefix="Failed to query FFmpeg encoders",
-    )
-
-    if "h264_nvenc" in encoder_output:
-        return "h264_nvenc"
-    return DEFAULT_VIDEO_CODEC
+    return get_ffmpeg_capabilities().preferred_h264_encoder
 
 
 def detect_gpu_pipeline() -> bool:
-    try:
-        output = _run_command(["ffmpeg", "-hide_banner", "-hwaccels"], "Failed to query hwaccels")
-        return "cuda" in output.lower()
-    except Exception:
-        return False
+    return get_ffmpeg_capabilities().nvenc_runtime_available
 
 
 def make_seamless_loop_clip(
@@ -1270,8 +1408,36 @@ def render_final_video(
         total_duration_seconds=target_duration_seconds,
         start_time=time.time(),
     )
-    gpu_ready = settings.mode != "preview" and detect_gpu_pipeline() and detect_h264_encoder() == "h264_nvenc"
-    encoder = "h264_nvenc" if gpu_ready else DEFAULT_VIDEO_CODEC
+    capabilities = get_ffmpeg_capabilities(logger=logger)
+    if settings.mode == "preview":
+        encoder = DEFAULT_VIDEO_CODEC
+        encoder_reason = "Preview mode uses CPU encoding for lower overhead."
+    elif capabilities.preferred_h264_encoder == "h264_nvenc":
+        encoder = "h264_nvenc"
+        encoder_reason = "NVENC runtime probe succeeded."
+    elif capabilities.nvenc_available and capabilities.nvenc_runtime_error:
+        encoder = DEFAULT_VIDEO_CODEC
+        encoder_reason = f"NVENC probe failed; falling back to CPU. Details: {capabilities.nvenc_runtime_error}"
+    elif capabilities.nvenc_available and not capabilities.cuda_hwaccel_available:
+        encoder = DEFAULT_VIDEO_CODEC
+        encoder_reason = "FFmpeg reports h264_nvenc, but CUDA hwaccel is unavailable; falling back to CPU."
+    elif capabilities.cuda_hwaccel_available and not capabilities.nvenc_available:
+        encoder = DEFAULT_VIDEO_CODEC
+        encoder_reason = "CUDA hwaccel detected, but h264_nvenc encoder is unavailable; falling back to CPU."
+    else:
+        encoder = DEFAULT_VIDEO_CODEC
+        encoder_reason = "NVENC unavailable; falling back to CPU encoding."
+    log_structured(
+        logger,
+        "video_encoder_selected",
+        mode=settings.mode,
+        selected_encoder=encoder,
+        reason=encoder_reason,
+        ffmpeg_path=capabilities.ffmpeg_path,
+        ffprobe_path=capabilities.ffprobe_path,
+        hwaccels=list(capabilities.hwaccels),
+        encoders=list(capabilities.encoders),
+    )
 
     # --- MEMORY SAFETY ---
     # Force a safe chunk size of 50. This keeps RAM usage incredibly low.

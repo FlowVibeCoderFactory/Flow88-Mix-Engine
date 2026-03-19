@@ -1,0 +1,24 @@
+{
+  "format": "flowmix",
+  "version": 1,
+  "ordered_clips": [
+    "ComfyUI_00008__4k.mp4",
+    "ComfyUI_00008__4k.mp4"
+  ],
+  "loop_counts": [
+    3,
+    3
+  ],
+  "transition": {
+    "enabled": true,
+    "type": "fade",
+    "duration": 1.0,
+    "curve": "linear"
+  },
+  "audio_file": "output/final_mix.wav",
+  "render_settings": {
+    "render_profile": "balanced",
+    "interface_scale": 1.5
+  },
+  "saved_at": "2026-03-19T03:01:24.530824+00:00"
+}

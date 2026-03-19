@@ -10,6 +10,7 @@ from typing import Any
 PROJECT_FILE_EXTENSION = ".flowmix"
 AUTOSAVE_FILE_NAME = f"autosave{PROJECT_FILE_EXTENSION}"
 APP_DATA_FOLDER_NAME = "Flow88MixEngine"
+PROJECTS_DIR_ENV_VAR = "FLOW88_PROJECTS_DIR"
 
 
 def _user_data_root() -> Path:
@@ -24,6 +25,9 @@ def _user_data_root() -> Path:
 
 
 def user_projects_dir() -> Path:
+    configured_dir = os.environ.get(PROJECTS_DIR_ENV_VAR)
+    if configured_dir and configured_dir.strip():
+        return Path(configured_dir.strip()).expanduser().resolve()
     return _user_data_root() / APP_DATA_FOLDER_NAME / "projects"
 
 

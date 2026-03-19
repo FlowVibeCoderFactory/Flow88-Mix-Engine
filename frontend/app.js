@@ -27,6 +27,8 @@ const openSourceAudioButton = document.getElementById("open-source-audio-button"
 const openSourceVideoButton = document.getElementById("open-source-video-button");
 const openOutputAudioButton = document.getElementById("open-output-audio-button");
 const openOutputVideoButton = document.getElementById("open-output-video-button");
+const manageProjectsAudioButton = document.getElementById("manage-projects-audio-button");
+const manageProjectsVideoButton = document.getElementById("manage-projects-video-button");
 const renderProfileSelect = document.getElementById("render-profile-select");
 const transitionTypeSelect = document.getElementById("transition-type-select");
 const transitionDurationRange = document.getElementById("transition-duration-range");
@@ -45,6 +47,20 @@ const audioProgressElement = document.getElementById("audio-progress");
 const videoProgressElement = document.getElementById("video-progress");
 const videoProgressBarElement = document.getElementById("video-progress-bar");
 const audioTotalDurationElement = document.getElementById("audio-total-duration");
+const fileManagerModal = document.getElementById("file-manager-modal");
+const fileManagerBackdrop = document.getElementById("file-manager-backdrop");
+const fileManagerCloseButton = document.getElementById("file-manager-close-button");
+const fileManagerTitleElement = document.getElementById("file-manager-title");
+const fileManagerDirectoryElement = document.getElementById("file-manager-directory");
+const fileManagerStatusElement = document.getElementById("file-manager-status");
+const fileManagerRefreshButton = document.getElementById("file-manager-refresh-button");
+const fileManagerUploadWrap = document.getElementById("file-manager-upload-wrap");
+const fileManagerUploadLabel = document.getElementById("file-manager-upload-label");
+const fileManagerUploadInput = document.getElementById("file-manager-upload-input");
+const fileManagerListBody = document.getElementById("file-manager-list-body");
+const fileManagerSortNameButton = document.getElementById("file-manager-sort-name");
+const fileManagerSortSizeButton = document.getElementById("file-manager-sort-size");
+const fileManagerSortDateButton = document.getElementById("file-manager-sort-date");
 
 const state = {
     activeTab: "audio",
@@ -63,6 +79,7 @@ const state = {
     nextVideoItemId: 1,
     currentProjectPath: null,
     audioFile: DEFAULT_AUDIO_FILE,
+    audioLibraryMessage: "",
     uiScale: DEFAULT_UI_SCALE,
     autosaveTimerHandle: null,
     autosaveArmed: false,
@@ -72,6 +89,24 @@ const state = {
         key: 1,
         title: 1,
         videoTitle: 1
+    },
+    fileManager: {
+        open: false,
+        contextKey: "",
+        title: "",
+        linkedTab: "audio",
+        listEndpoint: "",
+        uploadEndpoint: null,
+        renameEndpoint: "",
+        deleteEndpointBase: "",
+        downloadEndpointBase: null,
+        directory: "",
+        uploadLabel: "Upload Files",
+        emptyMessage: "No files found.",
+        sortKey: "name",
+        sortDirection: 1,
+        files: [],
+        refreshAction: null
     }
 };
 
@@ -222,6 +257,553 @@ function clampPercent(value) {
     return Math.max(0, Math.min(100, numeric));
 }
 
+function formatFileSize(bytes) {
+    const numeric = Number(bytes);
+    if (!Number.isFinite(numeric) || numeric < 0) {
+        return "--";
+    }
+
+    if (numeric < 1024) {
+        return `${numeric} B`;
+    }
+
+    const units = ["KB", "MB", "GB", "TB"];
+    let value = numeric / 1024;
+    let unitIndex = 0;
+    while (value >= 1024 && unitIndex < units.length - 1) {
+        value /= 1024;
+        unitIndex += 1;
+    }
+
+    const precision = value >= 100 ? 0 : 1;
+    return `${value.toFixed(precision)} ${units[unitIndex]}`;
+}
+
+function formatModifiedAt(timestamp) {
+    if (!timestamp) {
+        return "--";
+    }
+
+    const date = new Date(timestamp);
+    if (Number.isNaN(date.getTime())) {
+        return String(timestamp);
+    }
+
+    return new Intl.DateTimeFormat(undefined, {
+        year: "numeric",
+        month: "short",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit"
+    }).format(date);
+}
+
+function getCurrentProjectFileName() {
+    if (!state.currentProjectPath) {
+        return null;
+    }
+
+    const parts = String(state.currentProjectPath).split(/[\\/]/);
+    return parts[parts.length - 1] || null;
+}
+
+function updateCurrentProjectReference(oldName, newName = null) {
+    const currentFileName = getCurrentProjectFileName();
+    if (!currentFileName) {
+        return;
+    }
+
+    if (currentFileName.toLowerCase() !== String(oldName || "").toLowerCase()) {
+        return;
+    }
+
+    state.currentProjectPath = newName ? newName : null;
+}
+
+function updateAudioFileReference(oldName, newName = null) {
+    const currentFileName = String(state.audioFile || "").split(/[\\/]/).pop();
+    if (!currentFileName) {
+        return;
+    }
+
+    if (currentFileName.toLowerCase() !== String(oldName || "").toLowerCase()) {
+        return;
+    }
+
+    state.audioFile = newName ? `output/${newName}` : DEFAULT_AUDIO_FILE;
+}
+
+function setFileManagerStatus(message, type = "") {
+    if (!fileManagerStatusElement) {
+        return;
+    }
+
+    fileManagerStatusElement.textContent = message;
+    fileManagerStatusElement.classList.remove("success", "error");
+    if (type) {
+        fileManagerStatusElement.classList.add(type);
+    }
+}
+
+function buildFileManagerConfig(kind, tab) {
+    switch (kind) {
+        case "audio-input":
+            return {
+                contextKey: kind,
+                title: "Manage Input",
+                linkedTab: tab,
+                listEndpoint: `${apiBase}/api/files/input`,
+                uploadEndpoint: `${apiBase}/api/files/input/upload`,
+                renameEndpoint: `${apiBase}/api/files/input/rename`,
+                deleteEndpointBase: `${apiBase}/api/files/input`,
+                downloadEndpointBase: null,
+                uploadLabel: "Upload Audio Files",
+                emptyMessage: "No input audio files found.",
+                refreshAction: fetchTracks
+            };
+        case "video-input":
+            return {
+                contextKey: kind,
+                title: "Manage Video Input",
+                linkedTab: tab,
+                listEndpoint: `${apiBase}/api/files/input/videos`,
+                uploadEndpoint: `${apiBase}/api/files/input/videos/upload`,
+                renameEndpoint: `${apiBase}/api/files/input/videos/rename`,
+                deleteEndpointBase: `${apiBase}/api/files/input/videos`,
+                downloadEndpointBase: null,
+                uploadLabel: "Upload Video Files",
+                emptyMessage: "No video clips found in /input/videos.",
+                refreshAction: fetchVideos
+            };
+        case "output":
+            return {
+                contextKey: kind,
+                title: "Manage Output",
+                linkedTab: tab,
+                listEndpoint: `${apiBase}/api/files/output`,
+                uploadEndpoint: null,
+                renameEndpoint: `${apiBase}/api/files/output/rename`,
+                deleteEndpointBase: `${apiBase}/api/files/output`,
+                downloadEndpointBase: `${apiBase}/api/files/output`,
+                uploadLabel: "Upload Files",
+                emptyMessage: "No output files found.",
+                refreshAction: null
+            };
+        case "projects":
+            return {
+                contextKey: kind,
+                title: "Manage Projects",
+                linkedTab: tab,
+                listEndpoint: `${apiBase}/api/files/projects`,
+                uploadEndpoint: null,
+                renameEndpoint: `${apiBase}/api/files/projects/rename`,
+                deleteEndpointBase: `${apiBase}/api/files/projects`,
+                downloadEndpointBase: `${apiBase}/api/files/projects`,
+                uploadLabel: "Upload Files",
+                emptyMessage: "No project files found.",
+                refreshAction: null
+            };
+        default:
+            throw new Error(`Unknown file manager kind: ${kind}`);
+    }
+}
+
+function sortManagedFiles(files) {
+    const direction = state.fileManager.sortDirection;
+    const sortKey = state.fileManager.sortKey;
+    return [...files].sort((left, right) => {
+        if (sortKey === "size") {
+            const difference = Number(left.size_bytes || 0) - Number(right.size_bytes || 0);
+            if (difference !== 0) {
+                return difference * direction;
+            }
+            return compareText(left.file_name, right.file_name);
+        }
+
+        if (sortKey === "modified_at") {
+            const leftTime = new Date(left.modified_at || 0).getTime();
+            const rightTime = new Date(right.modified_at || 0).getTime();
+            if (leftTime !== rightTime) {
+                return (leftTime - rightTime) * direction;
+            }
+            return compareText(left.file_name, right.file_name);
+        }
+
+        return compareText(left.file_name, right.file_name) * direction;
+    });
+}
+
+function updateFileManagerSortButtons() {
+    const sortButtons = [
+        { button: fileManagerSortNameButton, key: "name", label: "Name" },
+        { button: fileManagerSortSizeButton, key: "size", label: "Size" },
+        { button: fileManagerSortDateButton, key: "modified_at", label: "Modified" }
+    ];
+
+    sortButtons.forEach(({ button, key, label }) => {
+        if (!button) {
+            return;
+        }
+
+        const isActive = state.fileManager.sortKey === key;
+        button.classList.toggle("active", isActive);
+        const arrow = isActive ? (state.fileManager.sortDirection === 1 ? " ^" : " v") : "";
+        button.textContent = `${label}${arrow}`;
+    });
+}
+
+function renderFileManagerRows() {
+    if (!fileManagerListBody) {
+        return;
+    }
+
+    fileManagerListBody.innerHTML = "";
+    const sortedFiles = sortManagedFiles(state.fileManager.files || []);
+
+    if (sortedFiles.length === 0) {
+        const emptyRow = document.createElement("tr");
+        emptyRow.innerHTML = `
+            <td class="file-manager-empty" colspan="5">${escapeHtml(state.fileManager.emptyMessage)}</td>
+        `;
+        fileManagerListBody.appendChild(emptyRow);
+        return;
+    }
+
+    sortedFiles.forEach((file) => {
+        const row = document.createElement("tr");
+        row.className = "track-row";
+        const fileDetail = file.detail
+            ? `<span class="file-manager-detail">${escapeHtml(file.detail)}</span>`
+            : "";
+        const fileStatus = file.status && file.status !== "supported"
+            ? `<span class="file-manager-status-tag ${escapeHtml(file.status)}">${escapeHtml(file.status)}</span>`
+            : "";
+        row.innerHTML = `
+            <td class="file-manager-name-cell">
+                <span class="file-manager-name-stack">
+                    <span>${escapeHtml(file.file_name)}</span>
+                    ${fileStatus}
+                    ${fileDetail}
+                </span>
+            </td>
+            <td class="file-manager-meta-cell">${escapeHtml(file.extension || "--")}</td>
+            <td class="file-manager-meta-cell">${escapeHtml(formatFileSize(file.size_bytes))}</td>
+            <td class="file-manager-meta-cell">${escapeHtml(formatModifiedAt(file.modified_at))}</td>
+            <td class="file-manager-meta-cell">
+                <span class="file-manager-actions"></span>
+            </td>
+        `;
+
+        const actionsWrap = row.querySelector(".file-manager-actions");
+        if (state.fileManager.downloadEndpointBase) {
+            const downloadButton = document.createElement("button");
+            downloadButton.type = "button";
+            downloadButton.className = "row-action-button";
+            downloadButton.textContent = "Download";
+            downloadButton.addEventListener("click", () => {
+                void downloadManagedFile(file.file_name);
+            });
+            actionsWrap?.appendChild(downloadButton);
+        }
+
+        const renameButton = document.createElement("button");
+        renameButton.type = "button";
+        renameButton.className = "row-action-button";
+        renameButton.textContent = "Rename";
+        renameButton.addEventListener("click", () => {
+            void renameManagedFile(file.file_name);
+        });
+        actionsWrap?.appendChild(renameButton);
+
+        const deleteButton = document.createElement("button");
+        deleteButton.type = "button";
+        deleteButton.className = "row-action-button";
+        deleteButton.textContent = "Delete";
+        deleteButton.addEventListener("click", () => {
+            void deleteManagedFile(file.file_name);
+        });
+        actionsWrap?.appendChild(deleteButton);
+
+        fileManagerListBody.appendChild(row);
+    });
+}
+
+async function refreshManagedSourceData() {
+    if (typeof state.fileManager.refreshAction === "function") {
+        return state.fileManager.refreshAction();
+    }
+    return { ok: true };
+}
+
+async function refreshFileManagerDirectory(options = {}) {
+    const loadingMessage = options.loadingMessage || "Loading files...";
+    const successMessage = options.successMessage || "";
+    const successType = options.successType || "";
+    const mirrorToPageStatus = options.mirrorToPageStatus !== false;
+
+    if (!state.fileManager.open || !state.fileManager.listEndpoint) {
+        return;
+    }
+
+    setFileManagerStatus(loadingMessage);
+
+    try {
+        const response = await fetch(state.fileManager.listEndpoint);
+        if (!response.ok) {
+            const message = await readApiError(response, `Failed to list files (HTTP ${response.status}).`);
+            throw new Error(message);
+        }
+
+        const payload = await response.json();
+        state.fileManager.files = payload.files || [];
+        state.fileManager.directory = payload.directory || "";
+        if (fileManagerDirectoryElement) {
+            fileManagerDirectoryElement.textContent = state.fileManager.directory;
+        }
+
+        renderFileManagerRows();
+        updateFileManagerSortButtons();
+
+        if (successMessage) {
+            setFileManagerStatus(successMessage, successType);
+            if (mirrorToPageStatus) {
+                setStatus(state.fileManager.linkedTab, successMessage, successType);
+            }
+            return;
+        }
+
+        if (state.fileManager.files.length === 0) {
+            setFileManagerStatus(state.fileManager.emptyMessage);
+            return;
+        }
+
+        const count = state.fileManager.files.length;
+        setFileManagerStatus(`Showing ${count} file${count === 1 ? "" : "s"}.`);
+    } catch (error) {
+        renderFileManagerRows();
+        setFileManagerStatus(error.message, "error");
+        setStatus(state.fileManager.linkedTab, error.message, "error");
+    }
+}
+
+async function openFileManager(kind, tab) {
+    const config = buildFileManagerConfig(kind, tab);
+    state.fileManager = {
+        ...state.fileManager,
+        ...config,
+        open: true,
+        directory: "",
+        files: [],
+        sortKey: "name",
+        sortDirection: 1
+    };
+
+    if (fileManagerTitleElement) {
+        fileManagerTitleElement.textContent = config.title;
+    }
+    if (fileManagerDirectoryElement) {
+        fileManagerDirectoryElement.textContent = "Loading directory...";
+    }
+    if (fileManagerUploadWrap) {
+        fileManagerUploadWrap.classList.toggle("hidden", !config.uploadEndpoint);
+    }
+    if (fileManagerUploadLabel) {
+        fileManagerUploadLabel.textContent = config.uploadLabel;
+    }
+    if (fileManagerUploadInput) {
+        fileManagerUploadInput.value = "";
+    }
+    fileManagerModal?.classList.remove("hidden");
+    fileManagerModal?.setAttribute("aria-hidden", "false");
+    renderFileManagerRows();
+    updateFileManagerSortButtons();
+    await refreshFileManagerDirectory();
+}
+
+function closeFileManager() {
+    state.fileManager.open = false;
+    if (fileManagerUploadInput) {
+        fileManagerUploadInput.value = "";
+    }
+    fileManagerModal?.classList.add("hidden");
+    fileManagerModal?.setAttribute("aria-hidden", "true");
+}
+
+async function downloadManagedFile(fileName) {
+    if (!state.fileManager.downloadEndpointBase) {
+        return;
+    }
+
+    try {
+        const response = await fetch(`${state.fileManager.downloadEndpointBase}/${encodeURIComponent(fileName)}/download`);
+        if (!response.ok) {
+            const message = await readApiError(response, `Download failed (HTTP ${response.status}).`);
+            throw new Error(message);
+        }
+
+        const blob = await response.blob();
+        const objectUrl = window.URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = objectUrl;
+        link.download = fileName;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        window.setTimeout(() => {
+            window.URL.revokeObjectURL(objectUrl);
+        }, 1000);
+        setFileManagerStatus(`Download started: ${fileName}`, "success");
+        setStatus(state.fileManager.linkedTab, `Download started: ${fileName}`, "success");
+    } catch (error) {
+        setFileManagerStatus(error.message, "error");
+        setStatus(state.fileManager.linkedTab, error.message, "error");
+    }
+}
+
+async function renameManagedFile(fileName) {
+    const nextName = window.prompt("Rename file", fileName);
+    if (!nextName) {
+        return;
+    }
+
+    try {
+        const response = await fetch(state.fileManager.renameEndpoint, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                old_name: fileName,
+                new_name: nextName
+            })
+        });
+        if (!response.ok) {
+            const message = await readApiError(response, `Rename failed (HTTP ${response.status}).`);
+            throw new Error(message);
+        }
+
+        const payload = await response.json();
+        const renamedFileName = payload.file_name || nextName.trim();
+
+        if (state.fileManager.contextKey === "projects") {
+            updateCurrentProjectReference(fileName, renamedFileName);
+        }
+        if (state.fileManager.contextKey === "output") {
+            updateAudioFileReference(fileName, renamedFileName);
+        }
+
+        const refreshResult = await refreshManagedSourceData();
+        const refreshOk = refreshResult?.ok !== false;
+        await refreshFileManagerDirectory({
+            loadingMessage: "Refreshing files...",
+            successMessage: refreshOk
+                ? `Renamed ${fileName} to ${renamedFileName}.`
+                : `Renamed ${fileName} to ${renamedFileName}, but the audio library reported: ${refreshResult.message}`,
+            successType: refreshOk ? "success" : "error",
+            mirrorToPageStatus: refreshOk
+        });
+    } catch (error) {
+        setFileManagerStatus(error.message, "error");
+        setStatus(state.fileManager.linkedTab, error.message, "error");
+    }
+}
+
+async function deleteManagedFile(fileName) {
+    const confirmed = window.confirm(`Delete ${fileName}? This cannot be undone.`);
+    if (!confirmed) {
+        return;
+    }
+
+    try {
+        const response = await fetch(`${state.fileManager.deleteEndpointBase}/${encodeURIComponent(fileName)}`, {
+            method: "DELETE"
+        });
+        if (!response.ok) {
+            const message = await readApiError(response, `Delete failed (HTTP ${response.status}).`);
+            throw new Error(message);
+        }
+
+        if (state.fileManager.contextKey === "projects") {
+            updateCurrentProjectReference(fileName, null);
+        }
+        if (state.fileManager.contextKey === "output") {
+            updateAudioFileReference(fileName, null);
+        }
+
+        const refreshResult = await refreshManagedSourceData();
+        const refreshOk = refreshResult?.ok !== false;
+        await refreshFileManagerDirectory({
+            loadingMessage: "Refreshing files...",
+            successMessage: refreshOk
+                ? `Deleted ${fileName}.`
+                : `Deleted ${fileName}, but the audio library reported: ${refreshResult.message}`,
+            successType: refreshOk ? "success" : "error",
+            mirrorToPageStatus: refreshOk
+        });
+    } catch (error) {
+        setFileManagerStatus(error.message, "error");
+        setStatus(state.fileManager.linkedTab, error.message, "error");
+    }
+}
+
+async function uploadManagedFiles() {
+    const files = Array.from(fileManagerUploadInput?.files || []);
+    if (files.length === 0 || !state.fileManager.uploadEndpoint) {
+        return;
+    }
+
+    let uploadedCount = 0;
+    try {
+        for (const file of files) {
+            setFileManagerStatus(`Uploading ${file.name}...`);
+            const formData = new FormData();
+            formData.append("file", file, file.name);
+
+            const response = await fetch(state.fileManager.uploadEndpoint, {
+                method: "POST",
+                body: formData
+            });
+            if (!response.ok) {
+                const message = await readApiError(response, `Upload failed (HTTP ${response.status}).`);
+                throw new Error(message);
+            }
+
+            uploadedCount += 1;
+        }
+
+        const refreshResult = await refreshManagedSourceData();
+        const refreshOk = refreshResult?.ok !== false;
+        const successMessage = uploadedCount === 1
+            ? `Uploaded ${files[0].name}.`
+            : `Uploaded ${uploadedCount} files.`;
+        await refreshFileManagerDirectory({
+            loadingMessage: "Refreshing files...",
+            successMessage: refreshOk
+                ? successMessage
+                : `${successMessage} The audio library reported: ${refreshResult.message}`,
+            successType: refreshOk ? "success" : "error",
+            mirrorToPageStatus: refreshOk
+        });
+    } catch (error) {
+        setFileManagerStatus(error.message, "error");
+        setStatus(state.fileManager.linkedTab, error.message, "error");
+    } finally {
+        if (fileManagerUploadInput) {
+            fileManagerUploadInput.value = "";
+        }
+    }
+}
+
+function setFileManagerSort(sortKey) {
+    if (state.fileManager.sortKey === sortKey) {
+        state.fileManager.sortDirection *= -1;
+    } else {
+        state.fileManager.sortKey = sortKey;
+        state.fileManager.sortDirection = sortKey === "modified_at" ? -1 : 1;
+    }
+
+    updateFileManagerSortButtons();
+    renderFileManagerRows();
+}
+
 function createVideoQueueItem(video, loopCount = 1) {
     const parsedLoopCount = parseLoopCount(loopCount);
     return {
@@ -354,7 +936,7 @@ function renderTracks() {
 
     if (state.tracks.length === 0) {
         setAudioTotalDuration(null);
-        setStatus("audio", "No tracks found in /input.", "error");
+        setStatus("audio", state.audioLibraryMessage || "No tracks found in the configured input directory.", "error");
         return;
     }
 
@@ -487,9 +1069,14 @@ async function fetchTracks() {
         }
 
         state.tracks = payload.tracks ?? [];
+        state.audioLibraryMessage = "";
         renderTracks();
+        return { ok: true, count: state.tracks.length };
     } catch (error) {
-        setStatus("audio", error.message, "error");
+        state.tracks = [];
+        state.audioLibraryMessage = error.message;
+        renderTracks();
+        return { ok: false, message: error.message };
     }
 }
 
@@ -1018,37 +1605,18 @@ async function pollVideoJobStatus(jobId) {
 }
 
 async function openOutputFolder(tab) {
-    setStatus(tab, "Opening output folder...");
-
-    try {
-        const response = await fetch(`${apiBase}/open-output`);
-        const payload = await response.json();
-        if (!response.ok) {
-            throw new Error(payload.detail || "Failed to open output folder.");
-        }
-
-        setStatus(tab, `Opened output folder: ${payload.output_dir}`, "success");
-    } catch (error) {
-        setStatus(tab, error.message, "error");
-    }
+    closeOpenMenus();
+    await openFileManager("output", tab);
 }
 
 async function openSourceFolder(tab) {
-    setStatus(tab, "Opening source folder...");
-    const endpoint = tab === "video" ? "/open-video-source" : "/open-audio-source";
+    closeOpenMenus();
+    await openFileManager(tab === "video" ? "video-input" : "audio-input", tab);
+}
 
-    try {
-        const response = await fetch(`${apiBase}${endpoint}`);
-        const payload = await response.json();
-        if (!response.ok) {
-            throw new Error(payload.detail || "Failed to open source folder.");
-        }
-
-        const folderPath = tab === "video" ? payload.video_source_dir : payload.audio_source_dir;
-        setStatus(tab, `Opened source folder: ${folderPath}`, "success");
-    } catch (error) {
-        setStatus(tab, error.message, "error");
-    }
+async function openProjectsManager(tab) {
+    closeOpenMenus();
+    await openFileManager("projects", tab);
 }
 
 function sortByBpm() {
@@ -1172,14 +1740,39 @@ saveProjectAsButton?.addEventListener("click", () => {
     closeOpenMenus();
     void saveProjectAs();
 });
-openSourceAudioButton.addEventListener("click", () => openSourceFolder("audio"));
-openSourceVideoButton.addEventListener("click", () => openSourceFolder("video"));
-openOutputAudioButton.addEventListener("click", () => openOutputFolder("audio"));
-openOutputVideoButton.addEventListener("click", () => openOutputFolder("video"));
+openSourceAudioButton.addEventListener("click", () => {
+    void openSourceFolder("audio");
+});
+openSourceVideoButton.addEventListener("click", () => {
+    void openSourceFolder("video");
+});
+openOutputAudioButton.addEventListener("click", () => {
+    void openOutputFolder("audio");
+});
+openOutputVideoButton.addEventListener("click", () => {
+    void openOutputFolder("video");
+});
+manageProjectsAudioButton?.addEventListener("click", () => {
+    void openProjectsManager("audio");
+});
+manageProjectsVideoButton?.addEventListener("click", () => {
+    void openProjectsManager("video");
+});
 sortBpmButton.addEventListener("click", sortByBpm);
 sortKeyButton.addEventListener("click", sortByKey);
 sortAzButton.addEventListener("click", sortByTitle);
 sortVideoAzButton.addEventListener("click", sortVideosByTitle);
+fileManagerRefreshButton?.addEventListener("click", () => {
+    void refreshFileManagerDirectory();
+});
+fileManagerCloseButton?.addEventListener("click", closeFileManager);
+fileManagerBackdrop?.addEventListener("click", closeFileManager);
+fileManagerUploadInput?.addEventListener("change", () => {
+    void uploadManagedFiles();
+});
+fileManagerSortNameButton?.addEventListener("click", () => setFileManagerSort("name"));
+fileManagerSortSizeButton?.addEventListener("click", () => setFileManagerSort("size"));
+fileManagerSortDateButton?.addEventListener("click", () => setFileManagerSort("modified_at"));
 renderProfileSelect?.addEventListener("change", () => {
     state.selectedRenderProfile = renderProfileSelect.value;
     scheduleAutosave();
@@ -1214,6 +1807,11 @@ document.addEventListener("click", (event) => {
         return;
     }
     closeOpenMenus();
+});
+document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && state.fileManager.open) {
+        closeFileManager();
+    }
 });
 
 window.addEventListener("load", async () => {

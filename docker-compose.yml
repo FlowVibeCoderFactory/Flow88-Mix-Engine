@@ -1,0 +1,37 @@
+services:
+  flow88:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: flow88-mix-engine:dgx-spark
+    container_name: flow88-mix-engine
+    restart: unless-stopped
+    init: true
+    ports:
+      - "8000:8000"
+    environment:
+      FLOW88_INPUT_DIR: /srv/flow88/input
+      FLOW88_OUTPUT_DIR: /srv/flow88/output
+      FLOW88_PROJECTS_DIR: /srv/flow88/projects
+      FLOW88_LOGS_DIR: /srv/flow88/logs
+      FLOW88_CORS_ORIGINS: ${FLOW88_CORS_ORIGINS:-*}
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,video,utility}
+    volumes:
+      - /srv/flow88/input:/srv/flow88/input
+      - /srv/flow88/output:/srv/flow88/output
+      - /srv/flow88/projects:/srv/flow88/projects
+      - /srv/flow88/logs:/srv/flow88/logs
+    gpus: all
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import json, sys, urllib.request; data = json.load(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)); sys.exit(0 if data.get('ok') else 1)",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s

@@ -1,0 +1,4 @@
+-r base.txt
+fastapi
+python-multipart
+uvicorn

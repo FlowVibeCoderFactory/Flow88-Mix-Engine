@@ -19,6 +19,10 @@
     box-sizing: border-box;
 }
 
+.hidden {
+    display: none !important;
+}
+
 html,
 body {
     margin: 0;
@@ -589,6 +593,191 @@ h1 {
     background: #303033;
 }
 
+.file-manager-modal {
+    position: fixed;
+    inset: 0;
+    z-index: 20;
+    display: grid;
+    place-items: center;
+    padding: 1rem;
+}
+
+.file-manager-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(8, 10, 14, 0.78);
+    backdrop-filter: blur(0.35rem);
+}
+
+.file-manager-dialog {
+    position: relative;
+    width: min(64rem, 100%);
+    max-height: min(90vh, 52rem);
+    overflow: hidden;
+    border: 0.0625rem solid var(--line);
+    border-radius: 1rem;
+    background: #18191c;
+    box-shadow: 0 1.2rem 3rem rgba(0, 0, 0, 0.45);
+}
+
+.file-manager-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 0.75rem;
+    padding: 1rem 1rem 0.75rem;
+    border-bottom: 0.0625rem solid #2b2d31;
+    background: linear-gradient(180deg, rgba(22, 45, 73, 0.75) 0%, rgba(24, 25, 28, 0.96) 100%);
+}
+
+.file-manager-header h2 {
+    margin: 0.16rem 0 0;
+    font-size: 1rem;
+    line-height: 1.1;
+    font-weight: 680;
+}
+
+.file-manager-close-button {
+    min-width: 4.75rem;
+}
+
+.file-manager-directory {
+    margin: 0.35rem 0 0;
+    color: #b9d3f5;
+    font-size: 0.72rem;
+    line-height: 1.45;
+    word-break: break-word;
+}
+
+.file-manager-toolbar {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 0.75rem;
+    padding: 0.85rem 1rem 0.7rem;
+}
+
+.file-manager-toolbar-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+}
+
+.file-upload-button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.file-upload-button span {
+    pointer-events: none;
+}
+
+.file-manager-status {
+    margin: 0;
+    color: var(--muted);
+    font-size: 0.74rem;
+    line-height: 1.45;
+    text-align: right;
+}
+
+.file-manager-status.success {
+    color: var(--ok);
+}
+
+.file-manager-status.error {
+    color: var(--error);
+}
+
+.file-manager-table-shell {
+    margin: 0 1rem 1rem;
+    max-height: min(62vh, 32rem);
+    overflow: auto;
+}
+
+.file-manager-table td {
+    padding: 0.5rem 0.42rem;
+    border-bottom: 0.0625rem solid #2c2c2f;
+    vertical-align: middle;
+}
+
+.file-manager-name-cell {
+    max-width: 22rem;
+    color: var(--text);
+    font-size: 0.8rem;
+    font-weight: 620;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.file-manager-name-stack {
+    display: grid;
+    gap: 0.15rem;
+}
+
+.file-manager-detail {
+    color: var(--muted);
+    font-size: 0.67rem;
+    font-weight: 500;
+    line-height: 1.35;
+    white-space: normal;
+}
+
+.file-manager-status-tag {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: fit-content;
+    padding: 0.1rem 0.45rem;
+    border-radius: 999rem;
+    border: 0.0625rem solid #6d5230;
+    background: #3d3021;
+    color: #ffd29b;
+    font-size: 0.62rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.03rem;
+}
+
+.file-manager-meta-cell {
+    color: var(--muted);
+    font-size: 0.72rem;
+    white-space: nowrap;
+}
+
+.file-manager-actions {
+    display: inline-flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 0.3rem;
+    flex-wrap: wrap;
+}
+
+.file-sort-button {
+    border: 0;
+    background: transparent;
+    color: #b3b3b8;
+    padding: 0;
+    font: inherit;
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.03rem;
+    text-transform: uppercase;
+    cursor: pointer;
+}
+
+.file-sort-button:hover,
+.file-sort-button.active {
+    color: #d7eaff;
+}
+
+.file-manager-empty {
+    color: var(--muted);
+    font-size: 0.78rem;
+    text-align: center;
+}
+
 .status.eta {
     font-size: 0.72rem;
 }
@@ -618,6 +807,18 @@ h1 {
 
     .status {
         text-align: left;
+    }
+
+    .file-manager-toolbar {
+        flex-direction: column;
+    }
+
+    .file-manager-status {
+        text-align: left;
+    }
+
+    .file-manager-table-shell {
+        max-height: 58vh;
     }
 
     .render-progress {
@@ -652,4 +853,3 @@ h1 {
         width: 5.75rem;
     }
 }
-

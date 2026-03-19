@@ -2,18 +2,26 @@ from pathlib import Path
 
 from analyzer import analyze_directory
 from mixer import DEFAULT_CROSSFADE_SECONDS, build_timeline, render_mix
+from project_persistence import ensure_projects_dir
+from runtime_config import get_runtime_settings
 from tracklist import write_tracklist
 
 
-INPUT_DIR = Path("input")
-OUTPUT_DIR = Path("output")
-MASTER_MIX_FILENAME = "flow88_master_mix.wav"
+RUNTIME_SETTINGS = get_runtime_settings()
+INPUT_DIR = RUNTIME_SETTINGS.input_dir
+VIDEO_INPUT_DIR = RUNTIME_SETTINGS.video_input_dir
+OUTPUT_DIR = RUNTIME_SETTINGS.output_dir
+MASTER_MIX_FILENAME = "final_mix.wav"
+LEGACY_MASTER_MIX_FILENAME = "flow88_master_mix.wav"
 TRACKLIST_FILENAME = "tracklist.txt"
 
 
 def ensure_runtime_directories() -> None:
     INPUT_DIR.mkdir(parents=True, exist_ok=True)
+    VIDEO_INPUT_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    RUNTIME_SETTINGS.logs_dir.mkdir(parents=True, exist_ok=True)
+    ensure_projects_dir()
 
 
 def run_pipeline() -> tuple[Path, Path] | None:

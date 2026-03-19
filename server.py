@@ -1,30 +1,53 @@
 from __future__ import annotations
 
+import json
+import logging
 import os
 import threading
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from analyzer import analyze_directory
+from analyzer import (
+    SUPPORTED_AUDIO_SUFFIXES,
+    AudioInputFile,
+    AudioInputDiscovery,
+    AudioLibraryScan,
+    discover_audio_input,
+    scan_audio_library,
+)
+from file_manager import (
+    FileManagerError,
+    delete_managed_file,
+    describe_managed_file,
+    ensure_managed_dir,
+    list_managed_files,
+    rename_managed_file,
+    require_existing_file,
+    resolve_managed_path,
+)
 from main import (
     INPUT_DIR,
+    LEGACY_MASTER_MIX_FILENAME,
     MASTER_MIX_FILENAME,
     OUTPUT_DIR,
     TRACKLIST_FILENAME,
+    VIDEO_INPUT_DIR,
     ensure_runtime_directories,
 )
 from mixer import DEFAULT_CROSSFADE_SECONDS, build_timeline, render_mix
 from models import TrackAnalysis, VideoAnalysis
 from render_logging import close_render_logger, create_render_logger, log_structured
+from runtime_config import get_runtime_settings
 from tracklist import write_tracklist
 from project_persistence import (
     autosave_project_path,
@@ -44,8 +67,7 @@ from video_processor import (
     PREVIEW_OUTPUT_FILENAME,
     RENDER_PROFILES,
     analyze_video_directory,
-    detect_gpu_pipeline,
-    detect_h264_encoder,
+    get_ffmpeg_capabilities,
     run_render_preflight,
     render_final_video,
 )
@@ -205,25 +227,110 @@ class ProjectListResponse(BaseModel):
     projects: list[ProjectListItemDTO]
 
 
+class ManagedFileDTO(BaseModel):
+    file_name: str
+    size_bytes: int
+    modified_at: str
+    extension: str
+    status: str | None = None
+    detail: str | None = None
+
+
+class ManagedFileListResponse(BaseModel):
+    directory: str
+    files: list[ManagedFileDTO]
+
+
+class RenameManagedFileRequest(BaseModel):
+    old_name: str
+    new_name: str
+
+
+class ManagedFileActionResponse(BaseModel):
+    directory: str
+    file_name: str
+    message: str
+    size_bytes: int | None = None
+
+
 class AutosaveStatusResponse(BaseModel):
     exists: bool
     path: str
     project: ProjectFileDTO | None = None
 
 
-app = FastAPI(title="Flow88 Mix Engine API", version="0.1.0")
-PROJECT_ROOT = Path(__file__).resolve().parent
-FRONTEND_DIR = PROJECT_ROOT / "frontend"
+class HealthResponse(BaseModel):
+    ok: bool
+    service: str
+    ffmpeg_available: bool
+    ffprobe_available: bool
+    encoder: str
+
+
+class DiagnosticsResponse(BaseModel):
+    service: str
+    server_mode: str
+    timestamp: str
+    directories: dict[str, str]
+    cors_origins: list[str]
+    desktop_open_supported: bool
+    ffmpeg: dict[str, Any]
+
+
+LOGGER = logging.getLogger("flow88.server")
+if not LOGGER.handlers:
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
+    LOGGER.addHandler(stream_handler)
+LOGGER.propagate = False
+LOGGER.setLevel(logging.INFO)
+RUNTIME_SETTINGS = get_runtime_settings()
+PROJECT_ROOT = RUNTIME_SETTINGS.project_root
+FRONTEND_DIR = RUNTIME_SETTINGS.frontend_dir
 SOURCE_AUDIO_DIR = INPUT_DIR
-VIDEO_INPUT_DIR = INPUT_DIR / "videos"
-FINAL_VIDEO_AUDIO_FILENAME = "final_mix.wav"
 FINAL_VIDEO_OUTPUT_FILENAME = "flow88_final_video.mov"
 JOB_PROGRESS: dict[str, JobProgress] = {}
 JOB_PROGRESS_LOCK = threading.Lock()
+UPLOAD_CHUNK_SIZE_BYTES = 1024 * 1024
+
+
+def _build_startup_diagnostics() -> dict[str, Any]:
+    capabilities = get_ffmpeg_capabilities()
+    return {
+        "service": "Flow88 Mix Engine",
+        "server_mode": "headless-fastapi",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "directories": {
+            "project_root": str(PROJECT_ROOT),
+            "frontend": str(FRONTEND_DIR),
+            "input": str(INPUT_DIR),
+            "video_input": str(VIDEO_INPUT_DIR),
+            "output": str(OUTPUT_DIR),
+            "projects": str(user_projects_dir().resolve()),
+            "logs": str(RUNTIME_SETTINGS.logs_dir),
+        },
+        "cors_origins": list(RUNTIME_SETTINGS.cors_origins),
+        "desktop_open_supported": hasattr(os, "startfile"),
+        "ffmpeg": capabilities.as_dict(),
+    }
+
+
+def _log_startup_diagnostics() -> None:
+    LOGGER.info("startup_diagnostics=%s", json.dumps(_build_startup_diagnostics(), sort_keys=True))
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    ensure_runtime_directories()
+    _log_startup_diagnostics()
+    yield
+
+
+app = FastAPI(title="Flow88 Mix Engine API", version="0.2.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=list(RUNTIME_SETTINGS.cors_origins),
+    allow_credentials=RUNTIME_SETTINGS.cors_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -257,12 +364,78 @@ def _video_to_dto(video: VideoAnalysis) -> VideoDTO:
     )
 
 
+def _audio_input_file_to_managed_dto(entry: AudioInputFile) -> ManagedFileDTO:
+    return ManagedFileDTO(
+        file_name=entry.file_path.name,
+        size_bytes=entry.size_bytes,
+        modified_at=entry.modified_at,
+        extension=entry.extension,
+        status=entry.status,
+        detail=entry.detail,
+    )
+
+
+def _log_audio_discovery(event_name: str, discovery: AudioInputDiscovery) -> None:
+    LOGGER.info(
+        "%s input_dir=%s total_files=%d supported_files=%d unsupported_files=%d files=%s",
+        event_name,
+        discovery.input_dir,
+        len(discovery.files),
+        len(discovery.supported_files),
+        len(discovery.unsupported_files),
+        [entry.file_path.name for entry in discovery.files],
+    )
+
+
+def _log_audio_scan(scan: AudioLibraryScan) -> None:
+    LOGGER.info(
+        "audio_track_scan input_dir=%s total_files=%d supported_files=%d track_count=%d rejected_files=%d files=%s tracks=%s rejected=%s",
+        scan.discovery.input_dir,
+        len(scan.discovery.files),
+        len(scan.discovery.supported_files),
+        len(scan.tracks),
+        len(scan.rejected_files),
+        [entry.file_path.name for entry in scan.discovery.files],
+        [track.file_path.name for track in scan.tracks],
+        [f"{entry.file_path.name}: {entry.detail}" for entry in scan.rejected_files],
+    )
+
+
+def _build_track_scan_error(scan: AudioLibraryScan) -> str:
+    input_dir = scan.discovery.input_dir
+    if not scan.discovery.files:
+        return f"No audio files found in: {input_dir}"
+
+    if scan.rejected_files:
+        rejected_preview = "; ".join(
+            f"{entry.file_path.name}: {entry.detail}" for entry in scan.rejected_files[:3]
+        )
+        if scan.discovery.unsupported_files:
+            unsupported_preview = ", ".join(
+                entry.file_path.name for entry in scan.discovery.unsupported_files[:3]
+            )
+            return (
+                f"Files were found in {input_dir}, but none were usable. "
+                f"Rejected during analysis: {rejected_preview}. "
+                f"Unsupported files: {unsupported_preview}."
+            )
+        return f"Files were found in {input_dir}, but audio analysis rejected them: {rejected_preview}"
+
+    unsupported_preview = ", ".join(entry.file_path.name for entry in scan.discovery.unsupported_files[:5])
+    supported_suffixes = ", ".join(sorted(SUPPORTED_AUDIO_SUFFIXES))
+    return (
+        f"Files were found in {input_dir}, but none matched the supported audio types "
+        f"({supported_suffixes}). Found: {unsupported_preview}"
+    )
+
+
 def _load_tracks() -> list[TrackAnalysis]:
     ensure_runtime_directories()
-    tracks = analyze_directory(INPUT_DIR)
-    if not tracks:
-        raise HTTPException(status_code=404, detail=f"No supported audio files found in: {INPUT_DIR.resolve()}")
-    return tracks
+    scan = scan_audio_library(INPUT_DIR)
+    _log_audio_scan(scan)
+    if not scan.tracks:
+        raise HTTPException(status_code=404, detail=_build_track_scan_error(scan))
+    return scan.tracks
 
 
 def _load_videos() -> list[VideoAnalysis]:
@@ -272,6 +445,50 @@ def _load_videos() -> list[VideoAnalysis]:
     if not videos:
         raise HTTPException(status_code=404, detail=f"No supported video files found in: {VIDEO_INPUT_DIR.resolve()}")
     return videos
+
+
+def _performance_profile_ready() -> tuple[bool, str]:
+    capabilities = get_ffmpeg_capabilities()
+    if capabilities.nvenc_runtime_available:
+        return True, "NVENC runtime probe succeeded."
+    if capabilities.ffmpeg_path is None:
+        return False, "ffmpeg not found in PATH."
+    if capabilities.ffprobe_path is None:
+        return False, "ffprobe not found in PATH."
+    if capabilities.nvenc_available and capabilities.nvenc_runtime_error:
+        return False, f"FFmpeg exposes h264_nvenc, but the runtime probe failed: {capabilities.nvenc_runtime_error}"
+    if capabilities.nvenc_available and not capabilities.cuda_hwaccel_available:
+        return False, "FFmpeg exposes h264_nvenc, but CUDA hwaccel is not reported by this build."
+    if capabilities.cuda_hwaccel_available and not capabilities.nvenc_available:
+        return False, "CUDA hwaccel is reported, but FFmpeg was built without h264_nvenc."
+    return False, "Neither usable NVENC nor CUDA hwaccel is available."
+
+
+def _ensure_performance_profile_support(render_profile: str) -> None:
+    if render_profile != "performance":
+        return
+
+    ready, reason = _performance_profile_ready()
+    if ready:
+        return
+
+    raise HTTPException(
+        status_code=400,
+        detail=f"Performance render profile requires NVENC on this server. {reason}",
+    )
+
+
+def _resolve_render_audio_input() -> Path:
+    ensure_runtime_directories()
+    primary_path = OUTPUT_DIR / MASTER_MIX_FILENAME
+    if primary_path.exists():
+        return primary_path
+
+    legacy_path = OUTPUT_DIR / LEGACY_MASTER_MIX_FILENAME
+    if legacy_path.exists():
+        return legacy_path
+
+    return primary_path
 
 
 def _resolve_ordered_tracks(all_tracks: list[TrackAnalysis], ordered_file_names: list[str]) -> list[TrackAnalysis]:
@@ -419,6 +636,125 @@ def _load_project_payload(path: str | Path) -> tuple[Path, ProjectFileDTO]:
     return resolved_path, project
 
 
+def _managed_file_to_dto(entry) -> ManagedFileDTO:
+    return ManagedFileDTO(
+        file_name=entry.file_name,
+        size_bytes=entry.size_bytes,
+        modified_at=entry.modified_at,
+        extension=entry.extension,
+    )
+
+
+def _raise_file_http_error(exc: FileManagerError) -> None:
+    raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
+def _projects_base_dir() -> Path:
+    return ensure_projects_dir().resolve()
+
+
+def _list_managed_directory(base_dir: Path) -> ManagedFileListResponse:
+    resolved_dir = ensure_managed_dir(base_dir)
+    files = list_managed_files(resolved_dir)
+    return ManagedFileListResponse(
+        directory=str(resolved_dir),
+        files=[_managed_file_to_dto(entry) for entry in files],
+    )
+
+
+def _list_audio_input_directory(base_dir: Path) -> ManagedFileListResponse:
+    resolved_dir = ensure_managed_dir(base_dir)
+    discovery = discover_audio_input(resolved_dir)
+    _log_audio_discovery("audio_input_file_manager_list", discovery)
+    return ManagedFileListResponse(
+        directory=str(discovery.input_dir),
+        files=[_audio_input_file_to_managed_dto(entry) for entry in discovery.files],
+    )
+
+
+async def _save_uploaded_file(base_dir: Path, upload: UploadFile) -> ManagedFileDTO:
+    resolved_dir = ensure_managed_dir(base_dir)
+    temp_path = resolved_dir / f".upload-{uuid.uuid4().hex}.part"
+
+    try:
+        if not upload.filename:
+            raise FileManagerError("Upload must include a file name.", status_code=400)
+
+        target_path = resolve_managed_path(resolved_dir, upload.filename)
+        if target_path.exists():
+            raise FileManagerError(f"File already exists: {target_path.name}", status_code=409)
+
+        total_bytes = 0
+        with temp_path.open("xb") as temp_file:
+            while True:
+                chunk = await upload.read(UPLOAD_CHUNK_SIZE_BYTES)
+                if not chunk:
+                    break
+
+                total_bytes += len(chunk)
+                if total_bytes > RUNTIME_SETTINGS.max_upload_size_bytes:
+                    raise FileManagerError(
+                        f"Upload exceeds the {RUNTIME_SETTINGS.max_upload_size_bytes} byte limit.",
+                        status_code=413,
+                    )
+                temp_file.write(chunk)
+
+        temp_path.replace(target_path)
+        return _managed_file_to_dto(describe_managed_file(target_path))
+    except FileManagerError:
+        if temp_path.exists():
+            temp_path.unlink(missing_ok=True)
+        raise
+    except OSError as exc:
+        if temp_path.exists():
+            temp_path.unlink(missing_ok=True)
+        raise FileManagerError(f"Failed to save upload: {exc}", status_code=500) from exc
+    finally:
+        await upload.close()
+
+
+def _delete_managed_directory_file(base_dir: Path, file_name: str) -> ManagedFileActionResponse:
+    try:
+        resolved_dir = ensure_managed_dir(base_dir)
+        deleted_path = delete_managed_file(resolved_dir, file_name)
+    except FileManagerError as exc:
+        _raise_file_http_error(exc)
+
+    return ManagedFileActionResponse(
+        directory=str(resolved_dir),
+        file_name=deleted_path.name,
+        message="File deleted.",
+    )
+
+
+def _rename_managed_directory_file(base_dir: Path, request: RenameManagedFileRequest) -> ManagedFileActionResponse:
+    try:
+        resolved_dir = ensure_managed_dir(base_dir)
+        renamed_path = rename_managed_file(resolved_dir, request.old_name, request.new_name)
+    except FileManagerError as exc:
+        _raise_file_http_error(exc)
+
+    return ManagedFileActionResponse(
+        directory=str(resolved_dir),
+        file_name=renamed_path.name,
+        message="File renamed.",
+    )
+
+
+def _download_managed_directory_file(base_dir: Path, file_name: str) -> FileResponse:
+    try:
+        resolved_dir = ensure_managed_dir(base_dir)
+        target_path = require_existing_file(resolved_dir, file_name)
+    except FileManagerError as exc:
+        _raise_file_http_error(exc)
+
+    return FileResponse(
+        target_path,
+        filename=target_path.name,
+        content_disposition_type="attachment",
+    )
+
+
 def _update_job_progress(job_id: str, **updates: Any) -> None:
     with JOB_PROGRESS_LOCK:
         progress = JOB_PROGRESS.get(job_id)
@@ -526,6 +862,132 @@ def get_index() -> FileResponse:
     return FileResponse(index_path)
 
 
+@app.get("/health", response_model=HealthResponse)
+def get_health() -> HealthResponse:
+    ensure_runtime_directories()
+    capabilities = get_ffmpeg_capabilities()
+    return HealthResponse(
+        ok=True,
+        service="Flow88 Mix Engine",
+        ffmpeg_available=capabilities.ffmpeg_path is not None,
+        ffprobe_available=capabilities.ffprobe_path is not None,
+        encoder=capabilities.preferred_h264_encoder,
+    )
+
+
+@app.get("/diagnostics", response_model=DiagnosticsResponse)
+def get_diagnostics() -> DiagnosticsResponse:
+    diagnostics = _build_startup_diagnostics()
+    return DiagnosticsResponse(**diagnostics)
+
+
+@app.get("/api/files/input", response_model=ManagedFileListResponse)
+def get_input_files() -> ManagedFileListResponse:
+    return _list_audio_input_directory(INPUT_DIR)
+
+
+@app.post("/api/files/input/upload", response_model=ManagedFileActionResponse)
+async def post_input_upload(file: UploadFile = File(...)) -> ManagedFileActionResponse:
+    try:
+        uploaded_file = await _save_uploaded_file(INPUT_DIR, file)
+    except FileManagerError as exc:
+        _raise_file_http_error(exc)
+
+    LOGGER.info(
+        "audio_input_upload input_dir=%s file_name=%s size_bytes=%d",
+        INPUT_DIR.resolve(),
+        uploaded_file.file_name,
+        uploaded_file.size_bytes or 0,
+    )
+
+    return ManagedFileActionResponse(
+        directory=str(INPUT_DIR.resolve()),
+        file_name=uploaded_file.file_name,
+        message="Upload complete.",
+        size_bytes=uploaded_file.size_bytes,
+    )
+
+
+@app.delete("/api/files/input/{filename}", response_model=ManagedFileActionResponse)
+def delete_input_file(filename: str) -> ManagedFileActionResponse:
+    return _delete_managed_directory_file(INPUT_DIR, filename)
+
+
+@app.post("/api/files/input/rename", response_model=ManagedFileActionResponse)
+def post_input_rename(request: RenameManagedFileRequest) -> ManagedFileActionResponse:
+    return _rename_managed_directory_file(INPUT_DIR, request)
+
+
+@app.get("/api/files/input/videos", response_model=ManagedFileListResponse)
+def get_input_video_files() -> ManagedFileListResponse:
+    return _list_managed_directory(VIDEO_INPUT_DIR)
+
+
+@app.post("/api/files/input/videos/upload", response_model=ManagedFileActionResponse)
+async def post_input_video_upload(file: UploadFile = File(...)) -> ManagedFileActionResponse:
+    try:
+        uploaded_file = await _save_uploaded_file(VIDEO_INPUT_DIR, file)
+    except FileManagerError as exc:
+        _raise_file_http_error(exc)
+
+    return ManagedFileActionResponse(
+        directory=str(VIDEO_INPUT_DIR.resolve()),
+        file_name=uploaded_file.file_name,
+        message="Upload complete.",
+        size_bytes=uploaded_file.size_bytes,
+    )
+
+
+@app.delete("/api/files/input/videos/{filename}", response_model=ManagedFileActionResponse)
+def delete_input_video_file(filename: str) -> ManagedFileActionResponse:
+    return _delete_managed_directory_file(VIDEO_INPUT_DIR, filename)
+
+
+@app.post("/api/files/input/videos/rename", response_model=ManagedFileActionResponse)
+def post_input_video_rename(request: RenameManagedFileRequest) -> ManagedFileActionResponse:
+    return _rename_managed_directory_file(VIDEO_INPUT_DIR, request)
+
+
+@app.get("/api/files/output", response_model=ManagedFileListResponse)
+def get_output_files() -> ManagedFileListResponse:
+    return _list_managed_directory(OUTPUT_DIR)
+
+
+@app.get("/api/files/output/{filename}/download")
+def download_output_file(filename: str) -> FileResponse:
+    return _download_managed_directory_file(OUTPUT_DIR, filename)
+
+
+@app.delete("/api/files/output/{filename}", response_model=ManagedFileActionResponse)
+def delete_output_file(filename: str) -> ManagedFileActionResponse:
+    return _delete_managed_directory_file(OUTPUT_DIR, filename)
+
+
+@app.post("/api/files/output/rename", response_model=ManagedFileActionResponse)
+def post_output_rename(request: RenameManagedFileRequest) -> ManagedFileActionResponse:
+    return _rename_managed_directory_file(OUTPUT_DIR, request)
+
+
+@app.get("/api/files/projects", response_model=ManagedFileListResponse)
+def get_project_files() -> ManagedFileListResponse:
+    return _list_managed_directory(_projects_base_dir())
+
+
+@app.get("/api/files/projects/{filename}/download")
+def download_project_file(filename: str) -> FileResponse:
+    return _download_managed_directory_file(_projects_base_dir(), filename)
+
+
+@app.delete("/api/files/projects/{filename}", response_model=ManagedFileActionResponse)
+def delete_project_file(filename: str) -> ManagedFileActionResponse:
+    return _delete_managed_directory_file(_projects_base_dir(), filename)
+
+
+@app.post("/api/files/projects/rename", response_model=ManagedFileActionResponse)
+def post_project_rename(request: RenameManagedFileRequest) -> ManagedFileActionResponse:
+    return _rename_managed_directory_file(_projects_base_dir(), request)
+
+
 @app.get("/tracks", response_model=TrackListResponse)
 def get_tracks() -> TrackListResponse:
     tracks = _load_tracks()
@@ -581,22 +1043,11 @@ def post_render_preflight(request: GenerateVideoRequest) -> RenderPreflightRespo
     requested_items = _normalize_video_items_request(request)
     render_profile = _normalize_render_profile(request.render_profile)
     transition_config = _normalize_transition_request(request.transition)
-
-    if render_profile == "performance":
-        try:
-            has_nvenc = detect_gpu_pipeline() and detect_h264_encoder() == "h264_nvenc"
-        except RuntimeError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        if not has_nvenc:
-            raise HTTPException(
-                status_code=400,
-                detail="Performance render profile requires CUDA/NVENC GPU support, but no compatible GPU was detected.",
-            )
-
+    _ensure_performance_profile_support(render_profile)
     all_videos = _load_videos()
     ordered_video_paths = _resolve_video_items(all_videos, requested_items)
 
-    audio_input_path = OUTPUT_DIR / FINAL_VIDEO_AUDIO_FILENAME
+    audio_input_path = _resolve_render_audio_input()
     if not audio_input_path.exists():
         raise HTTPException(
             status_code=404,
@@ -641,22 +1092,11 @@ def post_generate_video(request: GenerateVideoRequest) -> GenerateVideoJobRespon
     requested_items = _normalize_video_items_request(request)
     render_profile = _normalize_render_profile(request.render_profile)
     transition_config = _normalize_transition_request(request.transition)
-
-    if render_profile == "performance":
-        try:
-            has_nvenc = detect_gpu_pipeline() and detect_h264_encoder() == "h264_nvenc"
-        except RuntimeError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        if not has_nvenc:
-            raise HTTPException(
-                status_code=400,
-                detail="Performance render profile requires CUDA/NVENC GPU support, but no compatible GPU was detected.",
-            )
-
+    _ensure_performance_profile_support(render_profile)
     all_videos = _load_videos()
     ordered_video_paths = _resolve_video_items(all_videos, requested_items)
 
-    audio_input_path = OUTPUT_DIR / FINAL_VIDEO_AUDIO_FILENAME
+    audio_input_path = _resolve_render_audio_input()
     if not audio_input_path.exists():
         raise HTTPException(
             status_code=404,
@@ -694,7 +1134,7 @@ def post_generate_preview(request: GenerateVideoRequest) -> GenerateVideoJobResp
     all_videos = _load_videos()
     ordered_video_paths = _resolve_video_items(all_videos, requested_items)
 
-    audio_input_path = OUTPUT_DIR / FINAL_VIDEO_AUDIO_FILENAME
+    audio_input_path = _resolve_render_audio_input()
     if not audio_input_path.exists():
         raise HTTPException(
             status_code=404,
@@ -828,7 +1268,10 @@ def open_output() -> dict[str, str]:
     try:
         os.startfile(str(resolved_output_dir))
     except AttributeError as exc:
-        raise HTTPException(status_code=501, detail="Opening folders is only supported on Windows.") from exc
+        raise HTTPException(
+            status_code=501,
+            detail=f"Opening folders is only supported on Windows/local desktop runs. Use the mounted output directory: {resolved_output_dir}",
+        ) from exc
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"Failed to open output directory: {exc}") from exc
 
@@ -843,7 +1286,10 @@ def open_audio_source() -> dict[str, str]:
     try:
         os.startfile(str(resolved_audio_dir))
     except AttributeError as exc:
-        raise HTTPException(status_code=501, detail="Opening folders is only supported on Windows.") from exc
+        raise HTTPException(
+            status_code=501,
+            detail=f"Opening folders is only supported on Windows/local desktop runs. Use the mounted audio directory: {resolved_audio_dir}",
+        ) from exc
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"Failed to open source audio directory: {exc}") from exc
 
@@ -859,8 +1305,17 @@ def open_video_source() -> dict[str, str]:
     try:
         os.startfile(str(resolved_video_dir))
     except AttributeError as exc:
-        raise HTTPException(status_code=501, detail="Opening folders is only supported on Windows.") from exc
+        raise HTTPException(
+            status_code=501,
+            detail=f"Opening folders is only supported on Windows/local desktop runs. Use the mounted video directory: {resolved_video_dir}",
+        ) from exc
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"Failed to open source video directory: {exc}") from exc
 
     return {"status": "ok", "video_source_dir": str(resolved_video_dir)}
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host=RUNTIME_SETTINGS.host, port=RUNTIME_SETTINGS.port)

@@ -6,22 +6,18 @@ import time
 from pathlib import Path
 from typing import Any
 
-
-LOGS_DIR = Path("logs")
+from runtime_config import get_runtime_settings
 
 
 def create_render_logger() -> tuple[logging.Logger, Path]:
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    logs_dir = get_runtime_settings().logs_dir
+    logs_dir.mkdir(parents=True, exist_ok=True)
     timestamp = int(time.time())
-    log_path = LOGS_DIR / f"render_{timestamp}.log"
+    log_path = logs_dir / f"render_{timestamp}_{time.time_ns()}.log"
 
-    logger = logging.getLogger("render")
+    logger = logging.getLogger(f"render.{timestamp}.{time.time_ns()}")
     logger.setLevel(logging.INFO)
     logger.propagate = False
-
-    for existing_handler in list(logger.handlers):
-        logger.removeHandler(existing_handler)
-        existing_handler.close()
 
     handler = logging.FileHandler(log_path, encoding="utf-8")
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))

@@ -5,13 +5,13 @@ import threading
 import time
 
 import uvicorn
-import webview
 
 from server import app
+from runtime_config import get_runtime_settings
 
 
 HOST = "127.0.0.1"
-PORT = 8000
+PORT = get_runtime_settings().port
 WINDOW_URL = f"http://{HOST}:{PORT}"
 
 
@@ -30,6 +30,13 @@ def wait_for_server(timeout_seconds: float = 10.0) -> None:
 
 
 def main() -> None:
+    try:
+        import webview
+    except ImportError as exc:
+        raise SystemExit(
+            "Desktop mode requires pywebview. Install desktop extras with: pip install -r requirements/desktop.txt"
+        ) from exc
+
     server_thread = threading.Thread(target=run_server, daemon=True)
     server_thread.start()
     wait_for_server()

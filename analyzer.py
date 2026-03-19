@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import datetime, timezone
 import json
 import math
 import shutil
@@ -48,18 +50,86 @@ CAMOLOT_MAJOR = {
 }
 
 
-def discover_audio_files(input_dir: Path) -> list[Path]:
-    if not input_dir.exists():
-        return []
+@dataclass(slots=True, frozen=True)
+class AudioInputFile:
+    file_path: Path
+    size_bytes: int
+    modified_at: str
+    extension: str
+    status: str
+    detail: str | None = None
 
-    return sorted(
-        [
-            file_path
-            for file_path in input_dir.iterdir()
-            if file_path.is_file() and file_path.suffix.lower() in SUPPORTED_AUDIO_SUFFIXES
-        ],
-        key=lambda path: path.name.lower(),
+
+@dataclass(slots=True)
+class AudioInputDiscovery:
+    input_dir: Path
+    files: list[AudioInputFile]
+    supported_files: list[AudioInputFile]
+    unsupported_files: list[AudioInputFile]
+
+
+@dataclass(slots=True)
+class AudioLibraryScan:
+    discovery: AudioInputDiscovery
+    tracks: list[TrackAnalysis]
+    rejected_files: list[AudioInputFile]
+
+
+def _describe_input_file(file_path: Path, status: str, detail: str | None = None) -> AudioInputFile:
+    stat = file_path.stat()
+    return AudioInputFile(
+        file_path=file_path,
+        size_bytes=int(stat.st_size),
+        modified_at=datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+        extension=file_path.suffix.lower(),
+        status=status,
+        detail=detail,
     )
+
+
+def _is_temporary_upload_file(file_path: Path) -> bool:
+    return file_path.name.startswith(".upload-") and file_path.name.endswith(".part")
+
+
+def discover_audio_input(input_dir: Path) -> AudioInputDiscovery:
+    if not input_dir.exists():
+        return AudioInputDiscovery(
+            input_dir=input_dir.resolve(),
+            files=[],
+            supported_files=[],
+            unsupported_files=[],
+        )
+
+    files: list[AudioInputFile] = []
+    supported_files: list[AudioInputFile] = []
+    unsupported_files: list[AudioInputFile] = []
+
+    for file_path in sorted(
+        [path for path in input_dir.iterdir() if path.is_file() and not _is_temporary_upload_file(path)],
+        key=lambda path: path.name.lower(),
+    ):
+        if file_path.suffix.lower() in SUPPORTED_AUDIO_SUFFIXES:
+            described = _describe_input_file(file_path, status="supported")
+            supported_files.append(described)
+        else:
+            described = _describe_input_file(
+                file_path,
+                status="unsupported",
+                detail="Unsupported audio extension.",
+            )
+            unsupported_files.append(described)
+        files.append(described)
+
+    return AudioInputDiscovery(
+        input_dir=input_dir.resolve(),
+        files=files,
+        supported_files=supported_files,
+        unsupported_files=unsupported_files,
+    )
+
+
+def discover_audio_files(input_dir: Path) -> list[Path]:
+    return [entry.file_path for entry in discover_audio_input(input_dir).supported_files]
 
 
 def _first_tag_value(value: object) -> str | None:
@@ -248,12 +318,33 @@ def analyze_file(file_path: Path, silence_top_db: float = 60.0) -> TrackAnalysis
 
 
 def analyze_directory(input_dir: Path, silence_top_db: float = 60.0) -> list[TrackAnalysis]:
-    tracks: list[TrackAnalysis] = []
+    return scan_audio_library(input_dir=input_dir, silence_top_db=silence_top_db).tracks
 
-    for file_path in discover_audio_files(input_dir):
+
+def scan_audio_library(input_dir: Path, silence_top_db: float = 60.0) -> AudioLibraryScan:
+    discovery = discover_audio_input(input_dir)
+    tracks: list[TrackAnalysis] = []
+    rejected_files: list[AudioInputFile] = []
+
+    for discovered_file in discovery.supported_files:
+        file_path = discovered_file.file_path
         try:
             tracks.append(analyze_file(file_path=file_path, silence_top_db=silence_top_db))
         except Exception as exc:
+            rejected_files.append(
+                AudioInputFile(
+                    file_path=file_path,
+                    size_bytes=discovered_file.size_bytes,
+                    modified_at=discovered_file.modified_at,
+                    extension=discovered_file.extension,
+                    status="rejected",
+                    detail=str(exc),
+                )
+            )
             print(f"Skipping '{file_path.name}': {exc}", file=sys.stderr)
 
-    return tracks
+    return AudioLibraryScan(
+        discovery=discovery,
+        tracks=tracks,
+        rejected_files=rejected_files,
+    )

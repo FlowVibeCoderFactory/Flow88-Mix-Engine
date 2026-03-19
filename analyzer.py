@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+import logging
 import math
 import shutil
 import subprocess
@@ -16,6 +17,7 @@ from mutagen import File as MutagenFile
 from models import TrackAnalysis
 
 
+LOGGER = logging.getLogger("flow88.analyzer")
 SUPPORTED_AUDIO_SUFFIXES = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg"}
 NOTE_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
 KEY_PROFILE_MAJOR = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
@@ -173,6 +175,21 @@ def _parse_positive_float(value: object) -> float | None:
     return parsed
 
 
+def _coerce_scalar_float(value: object) -> float | None:
+    if value is None:
+        return None
+
+    if isinstance(value, np.ndarray):
+        if value.size == 0:
+            return None
+        return _parse_positive_float(value.reshape(-1)[0])
+
+    if isinstance(value, np.generic):
+        return _parse_positive_float(value.item())
+
+    return _parse_positive_float(value)
+
+
 def _probe_duration_seconds(file_path: Path) -> float:
     if shutil.which("ffprobe") is None:
         raise RuntimeError("ffprobe not found in PATH.")
@@ -225,7 +242,13 @@ def _analyze_waveform(
     effective_duration_seconds = max(0.0, min(duration_seconds, waveform_duration_seconds))
 
     tempo, _ = librosa.beat.beat_track(y=waveform, sr=sample_rate)
-    bpm = float(tempo) if tempo is not None and not math.isnan(float(tempo)) else None
+    LOGGER.debug(
+        "beat_track tempo file=%s type=%s shape=%s",
+        file_path.name,
+        type(tempo).__name__,
+        getattr(tempo, "shape", None),
+    )
+    bpm = _coerce_scalar_float(tempo)
 
     non_silent = librosa.effects.split(waveform, top_db=silence_top_db)
     if len(non_silent) == 0:

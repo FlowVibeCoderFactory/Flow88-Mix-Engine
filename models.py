@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from key_utils import format_key_display
+
 
 @dataclass(slots=True)
 class TrackAnalysis:
@@ -30,6 +32,11 @@ class TrackAnalysis:
     @property
     def trimmed_duration_seconds(self) -> float:
         return max(0.0, self.trim_end_seconds - self.trim_start_seconds)
+
+    @property
+    def display_key(self) -> str:
+        """Combined key display label, e.g. '7A · D minor'."""
+        return format_key_display(self.harmonic_key, self.musical_key)
 
 
 @dataclass(slots=True)

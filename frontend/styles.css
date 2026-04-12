@@ -281,7 +281,11 @@ h1 {
     text-overflow: ellipsis;
 }
 
-.col-key,
+.col-key {
+    width: 8.5rem;
+    text-align: right;
+}
+
 .col-bpm {
     width: 4.5rem;
     text-align: right;
@@ -833,7 +837,10 @@ h1 {
         width: auto;
     }
 
-    .col-key,
+    .col-key {
+        width: 7.5rem;
+    }
+
     .col-bpm,
     .col-start,
     .col-duration {

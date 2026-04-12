@@ -15,6 +15,7 @@ import numpy as np
 from mutagen import File as MutagenFile
 
 from models import TrackAnalysis
+from key_utils import NOTE_TO_CAMELOT_MAJOR, NOTE_TO_CAMELOT_MINOR, normalize_key_from_detector
 
 
 LOGGER = logging.getLogger("flow88.analyzer")
@@ -22,34 +23,6 @@ SUPPORTED_AUDIO_SUFFIXES = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg"}
 NOTE_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
 KEY_PROFILE_MAJOR = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
 KEY_PROFILE_MINOR = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
-CAMOLOT_MINOR = {
-    "A": "8A",
-    "A#": "3A",
-    "B": "10A",
-    "C": "5A",
-    "C#": "12A",
-    "D": "7A",
-    "D#": "2A",
-    "E": "9A",
-    "F": "4A",
-    "F#": "11A",
-    "G": "6A",
-    "G#": "1A",
-}
-CAMOLOT_MAJOR = {
-    "A": "11B",
-    "A#": "6B",
-    "B": "1B",
-    "C": "8B",
-    "C#": "3B",
-    "D": "10B",
-    "D#": "5B",
-    "E": "12B",
-    "F": "7B",
-    "F#": "2B",
-    "G": "9B",
-    "G#": "4B",
-}
 
 
 @dataclass(slots=True, frozen=True)
@@ -310,10 +283,7 @@ def _detect_harmonic_key(waveform: np.ndarray, sample_rate: int) -> tuple[str | 
             best_mode = "minor"
 
     note_name = NOTE_NAMES[best_note_index]
-    musical_key = f"{note_name} {best_mode}"
-    harmonic_key = (
-        CAMOLOT_MINOR.get(note_name) if best_mode == "minor" else CAMOLOT_MAJOR.get(note_name)
-    )
+    musical_key, harmonic_key = normalize_key_from_detector(note_name, best_mode)
     return musical_key, harmonic_key
 
 

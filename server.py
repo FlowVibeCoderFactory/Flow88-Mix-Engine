@@ -80,6 +80,7 @@ class TrackDTO(BaseModel):
     bpm: float | None
     musical_key: str | None
     harmonic_key: str | None
+    display_key: str
     duration: float
     duration_seconds: float
     trim_start_seconds: float
@@ -347,6 +348,7 @@ def _track_to_dto(track: TrackAnalysis) -> TrackDTO:
         bpm=track.bpm,
         musical_key=track.musical_key,
         harmonic_key=track.harmonic_key,
+        display_key=track.display_key,
         duration=track.duration,
         duration_seconds=track.duration_seconds,
         trim_start_seconds=track.trim_start_seconds,

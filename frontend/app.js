@@ -952,7 +952,7 @@ function renderTracks() {
             <td class="col-grip" aria-hidden="true">&#8942;&#8942;</td>
             <td class="col-title">${escapeHtml(track.title)}</td>
             <td class="col-artist">${escapeHtml(track.artist)}</td>
-            <td class="col-key"><span class="badge key">${escapeHtml(track.harmonic_key ?? "--")}</span></td>
+            <td class="col-key"><span class="badge key">${escapeHtml(track.display_key || track.harmonic_key || "--")}</span></td>
             <td class="col-bpm"><span class="badge">${formatBpm(track.bpm)} BPM</span></td>
             <td class="col-start"><span class="badge">${formatDuration(startTimes[index])}</span></td>
             <td class="col-duration"><span class="badge">${formatDuration(readTrackDurationSeconds(track))}</span></td>
@@ -1644,8 +1644,8 @@ function sortByKey() {
     state.sortDirection.key *= -1;
 
     state.tracks.sort((a, b) => {
-        const keyA = camelotToSortable(a.harmonic_key);
-        const keyB = camelotToSortable(b.harmonic_key);
+        const keyA = camelotToSortable(a.display_key || a.harmonic_key);
+        const keyB = camelotToSortable(b.display_key || b.harmonic_key);
 
         if (keyA.num !== keyB.num) {
             return (keyA.num - keyB.num) * state.sortDirection.key;
